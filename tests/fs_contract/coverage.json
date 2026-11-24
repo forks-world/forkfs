@@ -83,6 +83,7 @@
     },
     "path_resolution": {
       "case_ids": [
+        "open_create_through_symlink_parent_errors",
         "directory_entry_names_preserve_quote_newline_and_unicode",
         "file_directory_mismatch_and_trailing_slash",
         "mkdir_through_dangling_symlink_trailing_slash",
@@ -141,6 +142,7 @@
     },
     "create": {
       "case_ids": [
+        "open_create_through_symlink_parent_errors",
         "component_name_byte_limit_255_and_256",
         "mkdir_and_exclusive_create_conflicts"
       ],
@@ -159,6 +161,7 @@
     },
     "errno": {
       "case_ids": [
+        "open_create_through_symlink_parent_errors",
         "component_name_byte_limit_255_and_256",
         "dangling_symlink_lstat_readlink_and_follow",
         "symlink_create_typed_path_errors_and_alias_parent",
@@ -182,6 +185,7 @@
     },
     "failure_atomicity": {
       "case_ids": [
+        "open_create_through_symlink_parent_errors",
         "rpc_append_only_handle_and_live_clear",
         "rpc_immutable_flags_hardlink_revision",
         "binary_xattr_create_replace_remove",
@@ -265,6 +269,7 @@
     },
     "symlink": {
       "case_ids": [
+        "open_create_through_symlink_parent_errors",
         "dangling_symlink_lstat_readlink_and_follow",
         "symlink_create_typed_path_errors_and_alias_parent",
         "readlink_errno_and_traversal",
@@ -1195,6 +1200,7 @@
     },
     "flags": {
       "case_ids": [
+        "open_create_through_symlink_parent_errors",
         "append_dup_seek_writes_at_eof",
         "open_truncate_preserves_old_handle_inode",
         "open_nofollow_rejects_final_symlinks",
