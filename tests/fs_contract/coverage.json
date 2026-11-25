@@ -69,6 +69,7 @@
     },
     "metadata": {
       "case_ids": [
+        "path_metadata_resolution_errors_are_atomic",
         "binary_xattr_create_replace_remove",
         "chmod_and_utime_metadata_roundtrip",
         "rename_preserves_inode_and_payload",
@@ -83,6 +84,7 @@
     },
     "path_resolution": {
       "case_ids": [
+        "path_metadata_resolution_errors_are_atomic",
         "open_create_through_symlink_parent_errors",
         "directory_entry_names_preserve_quote_newline_and_unicode",
         "file_directory_mismatch_and_trailing_slash",
@@ -161,6 +163,7 @@
     },
     "errno": {
       "case_ids": [
+        "path_metadata_resolution_errors_are_atomic",
         "open_create_through_symlink_parent_errors",
         "component_name_byte_limit_255_and_256",
         "dangling_symlink_lstat_readlink_and_follow",
@@ -185,6 +188,7 @@
     },
     "failure_atomicity": {
       "case_ids": [
+        "path_metadata_resolution_errors_are_atomic",
         "open_create_through_symlink_parent_errors",
         "rpc_append_only_handle_and_live_clear",
         "rpc_immutable_flags_hardlink_revision",
@@ -269,6 +273,7 @@
     },
     "symlink": {
       "case_ids": [
+        "path_metadata_resolution_errors_are_atomic",
         "open_create_through_symlink_parent_errors",
         "dangling_symlink_lstat_readlink_and_follow",
         "symlink_create_typed_path_errors_and_alias_parent",
@@ -813,6 +818,7 @@
     },
     "chmod": {
       "case_ids": [
+        "path_metadata_resolution_errors_are_atomic",
         "chmod_and_utime_metadata_roundtrip",
         "relative_symlink_chmod_utime_follow_referent"
       ],
@@ -831,6 +837,7 @@
     },
     "times": {
       "case_ids": [
+        "path_metadata_resolution_errors_are_atomic",
         "chmod_and_utime_metadata_roundtrip",
         "relative_symlink_chmod_utime_follow_referent"
       ],

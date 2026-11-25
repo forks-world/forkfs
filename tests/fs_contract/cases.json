@@ -5919,6 +5919,25 @@
       ]
     },
     {
+      "id": "path_metadata_resolution_errors_are_atomic",
+      "families": ["metadata", "chmod", "times", "errno", "path_resolution", "failure_atomicity", "symlink"],
+      "profiles": ["reference", "mounted", "daemon"],
+      "layers": ["posix", "rpc"],
+      "mandatory": true,
+      "fixture": [
+        {"type": "file", "path": "regular", "data_hex": "6b656570"},
+        {"type": "symlink", "path": "dangling", "target": "missing"}
+      ],
+      "steps": [
+        {"op": "chmod", "args": {"path": "missing", "mode": 448}, "expect": {"errno": "ENOENT", "unchanged": true}},
+        {"op": "utime", "args": {"path": "missing", "atime_ns": 1000000000, "mtime_ns": 2000000000}, "expect": {"errno": "ENOENT", "unchanged": true}},
+        {"op": "chmod", "args": {"path": "dangling", "mode": 448}, "expect": {"errno": "ENOENT", "unchanged": true}},
+        {"op": "utime", "args": {"path": "dangling", "atime_ns": 1000000000, "mtime_ns": 2000000000}, "expect": {"errno": "ENOENT", "unchanged": true}},
+        {"op": "chmod", "args": {"path": "regular/child", "mode": 448}, "expect": {"errno": "ENOTDIR", "unchanged": true}},
+        {"op": "utime", "args": {"path": "regular/child", "atime_ns": 1000000000, "mtime_ns": 2000000000}, "expect": {"errno": "ENOTDIR", "unchanged": true}}
+      ]
+    },
+    {
       "id": "relative_symlink_chmod_utime_follow_referent",
       "families": [
         "symlink",
