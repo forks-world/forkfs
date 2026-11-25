@@ -455,6 +455,24 @@ int main(int argc,char** argv){@autoreleasepool {
         FSDirectoryVerifier expired=pagedVerifier;
         pagedPacker.limit=0;for(unsigned i=0;i<140;++i){enumeratePage(FSDirectoryCookieInitial);check(!result,"directory cursor leaked during eviction");}
         pagedVerifier=expired;enumeratePage(1);check(result.code==ESTALE,"evicted directory verifier must fail");
+        if(expectDots){
+            __block FSItem* rewindParent=nil;__block FSItemAttributes* rewindParentAttrs=nil;__block FSItemAttributes* pagedAttrs=nil;
+            [volume createItemNamed:[FSFileName nameWithString:@"rewind-parent"] type:FSItemTypeDirectory inDirectory:root attributes:[FSItemSetAttributesRequest new] replyHandler:^(FSItem* it,FSFileName* n,NSError* e){rewindParent=it;result=e;}];check(rewindParent && !result,"rewind parent creation failed");
+            [volume getAttributes:[FSItemGetAttributesRequest new] ofItem:rewindParent replyHandler:^(FSItemAttributes* a,NSError* e){rewindParentAttrs=a;result=e;}];check(!result && rewindParentAttrs,"rewind parent attributes failed");
+            [volume getAttributes:[FSItemGetAttributesRequest new] ofItem:paged replyHandler:^(FSItemAttributes* a,NSError* e){pagedAttrs=a;result=e;}];check(!result && pagedAttrs && pagedAttrs.parentID==rootAttrs.fileID,"paged initial parent identity failed");
+            RecordingPacker* dotsPacker=[RecordingPacker new];dotsPacker.limit=1;__block FSDirectoryVerifier dotsVerifier=FSDirectoryVerifierInitial;__block NSError* dotsError=nil;
+            [volume enumerateDirectory:paged startingAtCookie:FSDirectoryCookieInitial verifier:dotsVerifier providingAttributes:nil usingPacker:(FSDirectoryEntryPacker*)dotsPacker replyHandler:^(FSDirectoryVerifier v,NSError* e){dotsVerifier=v;dotsError=e;}];
+            check(!dotsError && dotsPacker.entries.count==1 && [dotsPacker.entries[0][@"name"] isEqual:@"."] && [dotsPacker.entries[0][@"id"] unsignedLongLongValue]==pagedAttrs.fileID,"paged dot snapshot failed");
+            FSDirectoryCookie dotCookie=[dotsPacker.entries[0][@"cookie"] unsignedLongLongValue];dotsPacker.packedThisCall=0;
+            [volume enumerateDirectory:paged startingAtCookie:550 verifier:dotsVerifier providingAttributes:nil usingPacker:(FSDirectoryEntryPacker*)dotsPacker replyHandler:^(FSDirectoryVerifier v,NSError* e){dotsVerifier=v;dotsError=e;}];check(!dotsError && dotsPacker.entries.count==2,"paged dots cross-page continuation failed");
+            [volume renameItem:paged inDirectory:root named:[FSFileName nameWithString:@"paged"] toNewName:[FSFileName nameWithString:@"paged"] inDirectory:rewindParent overItem:nil replyHandler:^(FSFileName* n,NSError* e){dotsError=e;}];check(!dotsError,"paged directory move failed");
+            dotsPacker.packedThisCall=0;
+            [volume enumerateDirectory:paged startingAtCookie:dotCookie verifier:dotsVerifier providingAttributes:nil usingPacker:(FSDirectoryEntryPacker*)dotsPacker replyHandler:^(FSDirectoryVerifier v,NSError* e){dotsVerifier=v;dotsError=e;}];
+            check(!dotsError && [dotsPacker.entries.lastObject[@"name"] isEqual:@".."] && [dotsPacker.entries.lastObject[@"id"] unsignedLongLongValue]==rootAttrs.fileID,"rewound dot parent changed after rename");
+            RecordingPacker* freshDots=[RecordingPacker new];freshDots.limit=2;__block FSDirectoryVerifier freshDotsVerifier=FSDirectoryVerifierInitial;
+            [volume enumerateDirectory:paged startingAtCookie:FSDirectoryCookieInitial verifier:freshDotsVerifier providingAttributes:nil usingPacker:(FSDirectoryEntryPacker*)freshDots replyHandler:^(FSDirectoryVerifier v,NSError* e){freshDotsVerifier=v;dotsError=e;}];
+            check(!dotsError && freshDots.entries.count==2 && [freshDots.entries[1][@"name"] isEqual:@".."] && [freshDots.entries[1][@"id"] unsignedLongLongValue]==rewindParentAttrs.fileID,"fresh dot parent did not follow rename");
+        }
         __block FSItemAttributes* victimAttrs=nil;
         [volume getAttributes:[FSItemGetAttributesRequest new] ofItem:snapshotVictim replyHandler:^(FSItemAttributes* a,NSError* e){victimAttrs=a;unlinkError=e;}];check(!unlinkError && victimAttrs.linkCount==0,"resumed snapshot resurrected an unlinked inode");
         [volume writeContents:[NSData dataWithBytes:"Z" length:1] toFile:file atOffset:0 replyHandler:^(size_t n,NSError* e){count=n;result=e;}];check(!result && count==1,"orphan write failed");
