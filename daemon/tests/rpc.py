@@ -11,6 +11,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 BIN = sys.argv[1]
@@ -269,6 +270,56 @@ with tempfile.TemporaryDirectory(prefix='ffrpc-',dir='/tmp') as tmp:
             with ThreadPoolExecutor(max_workers=8) as pool:list(pool.map(write,range(24)))
             for i in range(24):assert raw(['fs-cat',f'/src/p{i}'])==f'v{i}'.encode()
         finally:slow.close()
+        # Independent and duplicated append handles retain their open inode and
+        # serialize fixed records even when the original pathname is reused.
+        raw(['fs-write','/concurrent-append',b'HEAD'])
+        original_id=json.loads(raw(['fs-stat','/concurrent-append']))['inode_id']
+        append_first=json.loads(cli('fs-open','/concurrent-append','rw,append'))['handle']
+        append_duplicate=json.loads(raw(['fs-dup',append_first,'--session',session]))['handle']
+        append_independent=json.loads(cli('fs-open','/concurrent-append','rw,append'))['handle']
+        append_handles=[append_first,append_duplicate,append_independent]
+        record_size=8192
+        records={(writer,index): bytes([writer,index,0,255])+bytes([65+writer])*(record_size-4)
+                 for writer in range(3) for index in range(8)}
+        def append_phase(start):
+            barrier=threading.Barrier(3,timeout=10)
+            def append_writer(writer):
+                barrier.wait()
+                for index in range(start,start+4):
+                    result=json.loads(raw(['fs-hwrite-next',append_handles[writer],records[writer,index]]))
+                    assert result['written']==record_size
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                futures=[pool.submit(append_writer,writer) for writer in range(3)]
+                for future in futures:future.result(timeout=60)
+        def verify_append(expected_count):
+            data=raw(['fs-hread',append_first,'0',str(4+expected_count*record_size)])
+            assert data[:4]==b'HEAD' and len(data)==4+expected_count*record_size
+            chunks=[data[at:at+record_size] for at in range(4,len(data),record_size)]
+            assert len(set(chunks))==expected_count
+            assert set(chunks)=={records[writer,index] for writer in range(3) for index in range(expected_count//3)}
+            for writer in range(3):
+                assert [chunk[1] for chunk in chunks if chunk[0]==writer]==list(range(expected_count//3))
+            shared_last=max(index for index,chunk in enumerate(chunks) if chunk[0] in (0,1))
+            independent_last=max(index for index,chunk in enumerate(chunks) if chunk[0]==2)
+            for handle,expected in [(append_first,4+(shared_last+1)*record_size),
+                                    (append_duplicate,4+(shared_last+1)*record_size),
+                                    (append_independent,4+(independent_last+1)*record_size)]:
+                assert json.loads(raw(['fs-hseek',handle,'0','cur']))['offset']==expected
+            assert json.loads(raw(['fs-hstat',append_first]))['inode_id']==original_id
+            return data
+        append_phase(0)
+        verify_append(12)
+        cli('fs-rename','/concurrent-append','/concurrent-moved')
+        raw(['fs-write','/concurrent-append',b'REPLACEMENT'])
+        replacement_id=json.loads(raw(['fs-stat','/concurrent-append']))['inode_id']
+        assert replacement_id!=original_id
+        append_phase(4)
+        appended=verify_append(24)
+        assert json.loads(raw(['fs-stat','/concurrent-moved']))['inode_id']==original_id
+        assert raw(['fs-cat','/concurrent-moved'])==appended
+        assert json.loads(raw(['fs-stat','/concurrent-append']))['inode_id']==replacement_id
+        assert raw(['fs-cat','/concurrent-append'])==b'REPLACEMENT'
+        for append_handle in append_handles:cli('fs-close',append_handle)
         cli('fs-compact');cli('fs-check');cli('fs-check','--world','work')
         cli('fs-check','--revision','base')
         data.write_bytes(b'orphan');cli('fs-write','/dead-handle',data)
