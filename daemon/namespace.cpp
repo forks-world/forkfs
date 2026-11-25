@@ -181,6 +181,9 @@ void valid_utf8_text(const std::string& value, bool reject_controls) {
 }
 void valid_namespace_text(const std::string& value) { valid_utf8_text(value,true); }
 void valid_path_text(const std::string& value) { valid_utf8_text(value,false); }
+void valid_input_path_text(const std::string& value) {
+    try{valid_path_text(value);}catch(const std::runtime_error& error){throw std::system_error(EINVAL,std::generic_category(),error.what());}
+}
 void valid_stored_entry_name(const std::string& name) {
     need(!name.empty() && name!="." && name!=".." && name.find('/')==std::string::npos,
          "invalid directory name");
@@ -212,7 +215,7 @@ std::vector<std::string> components(const std::string& path,bool allow_trailing=
         auto name=path.substr(begin,end-begin);
         if(!name.empty()) {
             if(name.size()>255)throw std::system_error(ENAMETOOLONG,std::generic_category(),"path component exceeds 255 bytes");
-            valid_path_text(name);
+            valid_input_path_text(name);
             result.push_back(name);
         }
         if(end==path.size())break;
@@ -223,10 +226,10 @@ std::vector<std::string> components(const std::string& path,bool allow_trailing=
     if(trailing && !result.empty())result.push_back(".");
     return result;
 }
-std::vector<std::string> target_components(const std::string& target) {
+std::vector<std::string> target_components(const std::string& target,bool input=false) {
     need(!target.empty(),"invalid symlink target length");
     if(target.size()>4096)throw std::system_error(ENAMETOOLONG,std::generic_category(),"symlink target exceeds 4096 bytes");
-    valid_path_text(target);
+    if(input)valid_input_path_text(target);else valid_path_text(target);
     std::vector<std::string> result;size_t start=0;
     while(start<target.size()) {
         auto end=target.find('/',start);if(end==std::string::npos)end=target.size();auto name=target.substr(start,end-start);
@@ -1294,7 +1297,7 @@ InodeInfo Namespace::lstat(const std::string& path) const {
     std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);auto n=inode(view,resolve(view,path,false,nullptr,nullptr,true));allocation_info(n,view);remember_path(n.id,path);return n;
 }
 void Namespace::symlink(const std::string& target,const std::string& path) {
-    target_components(target);
+    target_components(target,true);
     update([&](const NamespaceView& view,Changes& c) {
         auto p=parent(view,path,nullptr,false,true);mutable_inode(inode(view,p.id));
         if(view.contains(p.key))throw std::system_error(EEXIST,std::generic_category(),"path already exists");
