@@ -2,7 +2,7 @@
 """Qualify native shared/blocking locks with explicit child-process handshakes.
 
 Owned scratch directory only. No daemon RPC locks, fairness/deadlock guarantee,
-network/distributed lock claim or OFD-lock qualification.
+network/distributed lock claim. OFD locks are a separate capability probe.
 """
 import argparse
 import ctypes
@@ -21,6 +21,18 @@ import tempfile
 from filesystem_compat import check, filesystem
 
 
+class Flock(ctypes.Structure):
+    _fields_=[('start',ctypes.c_int64),('length',ctypes.c_int64),('pid',ctypes.c_int32),('type',ctypes.c_int16),('whence',ctypes.c_int16)]
+
+
+def raw_fcntl(fd, command, request):
+    lib=ctypes.CDLL('/usr/lib/libSystem.B.dylib',use_errno=True)
+    lib.fcntl.argtypes=[ctypes.c_int,ctypes.c_int]
+    lib.fcntl.restype=ctypes.c_int
+    result=lib.fcntl(fd,command,ctypes.byref(request))
+    return result,ctypes.get_errno() if result==-1 else 0
+
+
 def lock(fd, kind, mode, nonblocking=False, start=0):
     op={'shared':fcntl.LOCK_SH,'exclusive':fcntl.LOCK_EX,'unlock':fcntl.LOCK_UN}[mode]
     if nonblocking:op|=fcntl.LOCK_NB
@@ -33,15 +45,11 @@ def child(args):
     try:
         if args.child=='interrupt':
             signal.signal(signal.SIGUSR1,lambda *_:None);signal.siginterrupt(signal.SIGUSR1,True)
-            class Flock(ctypes.Structure):
-                _fields_=[('start',ctypes.c_int64),('length',ctypes.c_int64),('pid',ctypes.c_int32),('type',ctypes.c_int16),('whence',ctypes.c_int16)]
             # Darwin sys/fcntl.h: F_WRLCK=3. ctypes makes one raw call, without
             # Python's automatic EINTR restart around fcntl/lockf wrappers.
-            request=Flock(0,8,0,3,os.SEEK_SET);lib=ctypes.CDLL('/usr/lib/libSystem.B.dylib',use_errno=True)
-            lib.fcntl.argtypes=[ctypes.c_int,ctypes.c_int]
-            lib.fcntl.restype=ctypes.c_int
+            request=Flock(0,8,0,3,os.SEEK_SET)
             print('ready',flush=True)
-            result=lib.fcntl(fd,fcntl.F_SETLKW,ctypes.byref(request));code=ctypes.get_errno()
+            result,code=raw_fcntl(fd,fcntl.F_SETLKW,request)
             check(result==-1 and code==errno.EINTR,'blocking fcntl did not return EINTR')
             print('interrupted',flush=True);return
         print('ready',flush=True)
@@ -119,27 +127,89 @@ def qualify(root,kind):
         if fd>=0:os.close(fd)
 
 
+def qualify_ofd(root):
+    path = root / 'ofd'
+    path.write_bytes(b'unchanged')
+    fd = os.open(path, os.O_RDWR)
+    duplicate = -1
+    other = -1
+    # Darwin SDK sys/fcntl.h ABI values, for Python builds without these names.
+    setlk = getattr(fcntl, 'F_OFD_SETLK', 90)
+    getlk = getattr(fcntl, 'F_OFD_GETLK', 92)
+
+    def request(start=0):
+        return Flock(start, 8, 0, fcntl.F_WRLCK, os.SEEK_SET)
+
+    def call(descriptor, command, record):
+        result, code = raw_fcntl(descriptor, command, record)
+        if result == -1:
+            raise OSError(code, os.strerror(code))
+
+    def check_conflict():
+        try:
+            call(other, setlk, request())
+        except OSError as error:
+            check(error.errno in (errno.EAGAIN, errno.EACCES),
+                  'unexpected OFD conflict errno %s' % error.errno)
+        else:
+            raise RuntimeError('independent OFD lock unexpectedly acquired')
+
+    try:
+        try:
+            call(fd, setlk, request())
+        except OSError as error:
+            if error.errno in (errno.EINVAL, errno.ENOSYS, errno.ENOTSUP, errno.EOPNOTSUPP):
+                return {'status': 'unsupported', 'errno': error.errno, 'error': str(error)}
+            raise
+        duplicate = os.dup(fd)
+        call(duplicate, setlk, request())
+        other = os.open(path, os.O_RDWR)
+        check_conflict()
+        found = request()
+        call(other, getlk, found)
+        actual = (found.type, found.start, found.length, found.pid)
+        check(actual == (fcntl.F_WRLCK, 0, 8, -1), 'unexpected OFD GETLK result: %s' % (actual,))
+        call(other, setlk, request(16))
+        os.close(fd)
+        fd = -1
+        check_conflict()
+        os.close(duplicate)
+        duplicate = -1
+        call(other, setlk, request())
+        check(path.read_bytes() == b'unchanged', 'OFD locking changed file bytes')
+        return {'status': 'passed', 'duplicate_reapply': True, 'independent_conflict': True,
+                'getlk_write_range_and_pid': True, 'disjoint_range': True,
+                'last_duplicate_close_releases': True, 'file_content_preserved': True}
+    finally:
+        for descriptor in (fd, duplicate, other):
+            if descriptor >= 0:
+                os.close(descriptor)
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('mountpoint',type=Path)
     parser.add_argument('--reference-apfs',action='store_true');parser.add_argument('--child',choices=['try','hold','interrupt'],help=argparse.SUPPRESS)
     parser.add_argument('--kind',choices=['flock','lockf'],help=argparse.SUPPRESS);parser.add_argument('--mode',choices=['shared','exclusive'],default='exclusive',help=argparse.SUPPRESS)
-    parser.add_argument('--start',type=int,default=0,help=argparse.SUPPRESS);parser.add_argument('--worker',choices=['flock','lockf'],help=argparse.SUPPRESS)
+    parser.add_argument('--start',type=int,default=0,help=argparse.SUPPRESS);parser.add_argument('--worker',choices=['flock','lockf','ofd'],help=argparse.SUPPRESS)
     args=parser.parse_args()
     if args.child:child(args);return 0
-    if args.worker:print(json.dumps(qualify(args.mountpoint,args.worker)));return 0
+    if args.worker:print(json.dumps(qualify_ofd(args.mountpoint) if args.worker=='ofd' else qualify(args.mountpoint,args.worker)));return 0
     check(sys.platform=='darwin','requires Darwin native locks');target=args.mountpoint.resolve(strict=True);mounted,kind=filesystem(target)
     check(kind==('apfs' if args.reference_apfs else 'forkfs'),'unexpected filesystem')
     if not args.reference_apfs:check(target==mounted and target.stat().st_mode&0o777==0o700,'requires private forkfs root')
-    root=Path(tempfile.mkdtemp(prefix='forkfs-locks-',dir=target));report={'schema':1,'platform':platform.platform(),'filesystem':kind,'cases':{},
-        'limits':['native kernel locks, not daemon RPC locks','no fairness/deadlock/OFD-lock or distributed guarantee','single-user private mount, small files']}
+    root=Path(tempfile.mkdtemp(prefix='forkfs-locks-',dir=target));report={'schema':1,'platform':platform.platform(),'filesystem':kind,'cases':{},'capability_probes':{},
+        'limits':['native kernel locks, not daemon RPC locks','no fairness/deadlock or distributed guarantee','OFD is a scoped capability probe','single-user private mount, small files']}
     try:
-        for case in ['flock','lockf']:
+        for case in ['flock','lockf','ofd']:
+            group=report['capability_probes'] if case=='ofd' else report['cases']
             try:
                 result=subprocess.run([sys.executable,str(Path(__file__).resolve()),str(root),'--worker',case],capture_output=True,text=True,timeout=45)
-                check(result.returncode==0,result.stderr.strip() or 'lock worker failed');report['cases'][case]={'status':'passed','details':json.loads(result.stdout)}
-            except (RuntimeError,subprocess.TimeoutExpired) as error:report['cases'][case]={'status':'failed','error':str(error)}
+                check(result.returncode==0,result.stderr.strip() or 'lock worker failed');details=json.loads(result.stdout)
+                status=details.pop('status','passed');group[case]={'status':status,'details':details}
+            except (RuntimeError,subprocess.TimeoutExpired) as error:group[case]={'status':'failed','error':str(error)}
     finally:shutil.rmtree(root)
-    print(json.dumps(report,indent=2));return int(any(v['status']!='passed' for v in report['cases'].values()))
+    print(json.dumps(report,indent=2));return int(any(v['status']!='passed' for v in report['cases'].values()) or
+                                                any(v['status']=='failed' for v in report['capability_probes'].values()))
 
 
 if __name__=='__main__':sys.exit(main())
