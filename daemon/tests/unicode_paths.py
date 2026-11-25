@@ -156,6 +156,17 @@ with tempfile.TemporaryDirectory(prefix='ff-unicode-', dir='/tmp') as temporary:
             rpc('inode-symlink', inode, '拒绝创建', name, *selector, error=error)
             rpc('inode-link', file_inode, inode, name, *selector, error=error)
             rpc('inode-rename', inode, 'RPC文件📄', inode, name, file_inode, '-', *selector, error=error)
+        # Raw frames exercise textual RPC arguments that cannot be passed via argv.
+        for bad in (b'\xff', b'\x00'):
+            path = b'/invalid-' + bad
+            rpc('fs-stat', path, error=errno.EINVAL)
+            rpc('fs-mkdir', path, *selector, error=errno.EINVAL)
+            rpc('fs-symlink', b'bad-' + bad, '/invalid-target-link', *selector, error=errno.EINVAL)
+        rpc('fs-stat', b'/' + b'a'*255 + b'\xff', error=errno.ENAMETOOLONG)
+        rpc('fs-mkdir', b'/' + b'a'*255 + b'\xff', *selector, error=errno.ENAMETOOLONG)
+        rpc('fs-lstat', '/invalid-target-link', error=errno.ENOENT)
+        assert obj('status')['last_committed_seq'] == sequence
+        assert rpc('fs-cat', '/RPC文件📄') == b'\xff\x00binary'
         for name in ['a'*256, 'é'*128]:
             rpc('inode-lookup', inode, name, *selector, error=errno.ENAMETOOLONG)
             rpc('inode-create', inode, name, str(0o600), *selector, error=errno.ENAMETOOLONG)

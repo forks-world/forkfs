@@ -195,7 +195,12 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
     need(args.size()==count,"invalid RPC command arguments");
     if(op=="fs-set-volume-name" && args[1].find('\0')!=args[1].npos)throw RpcError(EINVAL,"NUL in volume name");
     need((op!="fs-diff" && op!="fs-history") || !selected_view,"invalid view selector for revision query");
-    for(size_t i=0;i<args.size();++i)if(!(((op=="fs-xattr-set" || op=="fs-hxattr-set" || op=="inode-xattr-set") && i==4) || ((op=="fs-write" || op=="fs-save" || op=="fs-append" || op=="fs-happend" || op=="fs-hwrite-next") && i==2) || ((op=="fs-write-at" || op=="fs-hwrite" || op=="fs-hwriteback") && i==3)))need(args[i].find('\0')==std::string::npos,"NUL in RPC argument");
+    for(size_t i=0;i<args.size();++i) {
+        const bool binary=((op=="fs-xattr-set" || op=="fs-hxattr-set" || op=="inode-xattr-set") && i==4) ||
+                          ((op=="fs-write" || op=="fs-save" || op=="fs-append" || op=="fs-happend" || op=="fs-hwrite-next") && i==2) ||
+                          ((op=="fs-write-at" || op=="fs-hwrite" || op=="fs-hwriteback") && i==3);
+        if(!binary && args[i].find('\0')!=std::string::npos)throw RpcError(EINVAL,"NUL in RPC argument");
+    }
     if(op=="session-open") {
         auto lease=number(args[1]);auto token=sessions.create(lease);
         return "{\"session\":\""+token+"\",\"lease_ms\":"+std::to_string(lease)+"}\n";
