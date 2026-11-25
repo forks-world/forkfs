@@ -2487,6 +2487,22 @@
       ]
     },
     {
+      "id": "xattr_path_resolution_errors_are_atomic",
+      "families": ["xattr", "metadata", "errno", "path_resolution", "failure_atomicity"],
+      "profiles": ["reference", "mounted", "daemon"],
+      "layers": ["posix", "rpc"],
+      "mandatory": true,
+      "fixture": [{"type": "file", "path": "regular", "data_hex": "6b656570"}],
+      "steps": [
+        {"op": "xattr_get", "args": {"path": "missing", "name": "user.contract"}, "expect": {"errno": "ENOENT", "unchanged": true}},
+        {"op": "xattr_set", "args": {"path": "missing", "name": "user.contract", "value_hex": "00ff", "policy": "upsert"}, "expect": {"errno": "ENOENT", "unchanged": true}},
+        {"op": "xattr_remove", "args": {"path": "missing", "name": "user.contract"}, "expect": {"errno": "ENOENT", "unchanged": true}},
+        {"op": "xattr_get", "args": {"path": "regular/child", "name": "user.contract"}, "expect": {"errno": "ENOTDIR", "unchanged": true}},
+        {"op": "xattr_set", "args": {"path": "regular/child", "name": "user.contract", "value_hex": "00ff", "policy": "upsert"}, "expect": {"errno": "ENOTDIR", "unchanged": true}},
+        {"op": "xattr_remove", "args": {"path": "regular/child", "name": "user.contract"}, "expect": {"errno": "ENOTDIR", "unchanged": true}}
+      ]
+    },
+    {
       "id": "binary_xattr_create_replace_remove",
       "families": [
         "xattr",

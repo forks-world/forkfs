@@ -561,7 +561,7 @@ Namespace::XattrPolicy Namespace::xattr_policy(const std::string& value) {
     throw std::runtime_error("invalid extended attribute policy");
 }
 std::pair<InodeInfo,bool> Namespace::xattr_inode(const NamespaceView& view,const std::string& target,bool handle) const {
-    if(!handle)return {inode(view,resolve(view,target,false)),true};
+    if(!handle)return {inode(view,resolve(view,target,false,nullptr,nullptr,true)),true};
     const auto& info=find_handle(target);bool linked=view.contains(inode_key(info.inode));
     return {linked?inode(view,info.inode):decode_inode(container_.journal_->get(orphan_prefix(view_,info.inode)+"inode"),info.inode,true),linked};
 }
