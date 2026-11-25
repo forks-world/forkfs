@@ -1074,7 +1074,8 @@
           "script": "scripts/tests/filesystem_compat.py",
           "status": "not_run",
           "scenarios": [
-            "mapped_io: MAP_SHARED/MAP_PRIVATE and readonly mappings, pread/pwrite coherence, msync and unlink mappings"
+            "mapped_io: MAP_SHARED/MAP_PRIVATE and readonly mappings, pread/pwrite coherence, msync and unlink mappings",
+            "mmap-truncate: cross-process page-aligned truncate, SIGBUS on a previously touched whole page beyond EOF, and regrowth zero-fill via mmap and pread"
           ]
         }
       ],

@@ -404,6 +404,7 @@ python3 scripts/tests/filesystem_compat.py /private/tmp --reference-apfs
 | 用例 | 验证内容 |
 | --- | --- |
 | mmap | shared/private/read-only、页边界、pread/pwrite 一致性、另一进程读取、unlink 后映射与同名新文件隔离 |
+| mmap-truncate | 跨进程按页截断：预触碰的完整页在 EOF 之外时触发 SIGBUS，重新扩展后的字节经 mmap 和 pread 读取为零。macOS 27.2.1、16 KiB 页的 APFS 参考及历史 ForkFS 私有临时挂载通过；后者使用 2026-11-13 注册的签名扩展和 daemon `282abf9`，并非当前候选挂载。未覆盖 EOF 内的部分页 |
 | lockf / flock | 另一进程争锁必须失败、关闭及进程退出释放；lockf 另测互不相交范围 |
 | SQLite DELETE / WAL | 显式模式确认、二进制数据、并发读与写锁冲突、rollback、进程未 close 即退出后的事务恢复、integrity_check、WAL checkpoint |
 | Git | init/add/commit、分支 checkout、可执行位/符号链接、fast-forward merge、repack、strict fsck、历史二进制内容 |

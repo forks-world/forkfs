@@ -14,7 +14,9 @@ import mmap
 import os
 from pathlib import Path
 import platform
+import select
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -68,6 +70,54 @@ def mapped_io(root):
             mapping.flush()
         os.fsync(stream.fileno())
     return {'page_size': page, 'shared_private_readonly': True, 'open_unlink': True}
+
+
+def truncate_regrow(root):
+    path = root / 'mapped-truncate'
+    page = mmap.PAGESIZE
+    with path.open('w+b') as stream:
+        stream.truncate(3 * page)
+        os.pwrite(stream.fileno(), b'RETAINED', 0)
+        os.pwrite(stream.fileno(), b'DISCARDED', 2 * page)
+        code = '''import mmap, os, resource, sys
+resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+page = int(sys.argv[2])
+with open(sys.argv[1], 'rb') as stream:
+    with mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as mapping:
+        if mapping[2 * page:2 * page + 9] != b'DISCARDED':
+            raise RuntimeError('initial mapped marker mismatch')
+        os.write(1, b'R')
+        if os.read(0, 1) != b'X':
+            raise RuntimeError('release handshake failed')
+        value = mapping[2 * page]
+'''
+        process = subprocess.Popen([sys.executable, '-c', code, str(path), str(page)],
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE)
+        try:
+            ready, _, _ = select.select([process.stdout], [], [], 20)
+            check(ready and process.stdout.read(1) == b'R', 'mapping child did not become ready')
+            with path.open('r+b') as truncator:
+                os.ftruncate(truncator.fileno(), page)
+            _, stderr = process.communicate(input=b'X', timeout=20)
+            check(process.returncode == -signal.SIGBUS,
+                  'mapping child expected SIGBUS, got %s: %s' %
+                  (process.returncode, stderr.decode(errors='replace')))
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.communicate()
+        check(os.pread(stream.fileno(), 8, 0) == b'RETAINED', 'truncate changed retained page')
+        os.ftruncate(stream.fileno(), 3 * page)
+        check(os.pread(stream.fileno(), 2 * page, page) == bytes(2 * page),
+              'regrown bytes from pread are not zero')
+        with mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_WRITE) as mapping:
+            check(mapping[page:3 * page] == bytes(2 * page), 'regrown mapping is not zero')
+            mapping[2 * page:2 * page + 7] = b'REGROWN'
+            check(os.pread(stream.fileno(), 7, 2 * page) == b'REGROWN',
+                  'regrown mmap -> pread coherence')
+    return {'page_size': page, 'beyond_eof_sigbus': True,
+            'regrowth_zero_mmap_and_pread': True, 'regrowth_mmap_pread_coherence': True}
 
 
 def rejects(operation, expected):
@@ -428,7 +478,8 @@ def git_workflow(root):
     return {'version': git('--version').decode().strip(), 'checkout_merge_repack_fsck': True}
 
 
-CASES = {'mmap': mapped_io, 'lockf': lambda root: locks(root, 'lockf'),
+CASES = {'mmap': mapped_io, 'mmap-truncate': truncate_regrow,
+         'lockf': lambda root: locks(root, 'lockf'),
          'flock': lambda root: locks(root, 'flock'),
          'sqlite-delete': lambda root: database(root, 'DELETE'),
          'sqlite-wal': lambda root: database(root, 'WAL'), 'git': git_workflow,
