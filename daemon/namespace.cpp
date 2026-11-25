@@ -1166,7 +1166,7 @@ uint64_t Namespace::append(const std::string& path,const Bytes& value) {
     uint64_t offset=0;edit_content(path,[&](FileContent& data){offset=data.size();return data.write(offset,value);});return offset;
 }
 void Namespace::truncate(const std::string& path,uint64_t size) {
-    need(size<=maximum_file_size,"file exceeds 1 TiB");
+    if(size>maximum_file_size)throw std::system_error(EFBIG,std::generic_category(),"file exceeds 1 TiB");
     edit_content(path,[&](FileContent& data){return data.resize(size);});
 }
 void Namespace::punch_hole(const std::string& path,uint64_t offset,uint64_t length) {
@@ -1992,7 +1992,7 @@ uint64_t Namespace::handle_append(const std::string& token,const Bytes& value) {
     uint64_t offset=0;edit_handle(token,[&](FileContent& data,bool){offset=data.size();return data.write(offset,value);});return offset;
 }
 void Namespace::handle_truncate(const std::string& token,uint64_t size) {
-    need(size<=maximum_file_size,"file exceeds 1 TiB");
+    if(size>maximum_file_size)throw std::system_error(EFBIG,std::generic_category(),"file exceeds 1 TiB");
     edit_handle(token,[&](FileContent& data,bool){return data.resize(size);});
 }
 void Namespace::handle_punch_hole(const std::string& token,uint64_t offset,uint64_t length) {

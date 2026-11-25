@@ -177,6 +177,25 @@ with tempfile.TemporaryDirectory(prefix='ffrpc-',dir='/tmp') as tmp:
         assert cli('fs-cat','/src/moved','--world','work')==b'branch\0bytes'
         cli('fs-unlink','/alias','--world','work')
         cli('fs-mkdir','/empty');cli('fs-rmdir','/empty')
+        # Path and handle truncate reject sizes beyond the sparse 1 TiB limit.
+        maximum=1<<40
+        raw(['fs-write','/truncate-limit',b'HEAD'])
+        raw(['fs-truncate','/truncate-limit',str(maximum)])
+        raw(['fs-write-at','/truncate-limit',str(maximum-1),b'Z'])
+        truncate_handle=json.loads(cli('fs-open','/truncate-limit','rw'))['handle']
+        truncate_dup=json.loads(raw(['fs-dup',truncate_handle,'--session',session]))['handle']
+        assert json.loads(raw(['fs-hseek',truncate_handle,'17','set']))['offset']==17
+        truncate_seq=json.loads(raw(['status']))['last_committed_seq']
+        for operation in [['fs-truncate','/truncate-limit',str(maximum+1)],
+                          ['fs-htruncate',truncate_handle,str(maximum+1)]]:
+            raw(operation,ok=False,expected_code=errno.EFBIG+1)
+            assert json.loads(raw(['status']))['last_committed_seq']==truncate_seq
+            assert json.loads(raw(['fs-hstat',truncate_dup]))['size']==maximum
+            assert raw(['fs-hread',truncate_dup,'0','4'])==b'HEAD'
+            assert raw(['fs-hread',truncate_dup,str(maximum-1),'1'])==b'Z'
+            assert json.loads(raw(['fs-hseek',truncate_dup,'0','cur']))['offset']==17
+        cli('fs-close',truncate_dup);cli('fs-close',truncate_handle)
+        cli('fs-unlink','/truncate-limit')
         # Offset operations use the same resident transaction and retain snapshots.
         data.write_bytes(b'abcdef');cli('fs-write','/offset',data)
         data.write_bytes(b'XY');cli('fs-write-at','/offset','2',data)

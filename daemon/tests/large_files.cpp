@@ -7,6 +7,7 @@
 using forkfs::Container;using forkfs::Namespace;using Bytes=std::vector<unsigned char>;
 static void check(bool ok,int line=__builtin_LINE()){if(!ok)throw std::runtime_error("large file check failed at line "+std::to_string(line));}
 template<class F> static void rejects(F f){bool failed=false;try{f();}catch(const std::exception&){failed=true;}check(failed);}
+template<class F> static void rejects_errno(F f,int code){bool failed=false;try{f();}catch(const std::system_error& e){failed=e.code().value()==code;}check(failed);}
 int main(){
     char pattern[]="/tmp/ff-io-large-XXXXXX";auto tmp=mkdtemp(pattern);if(!tmp)return 1;
     auto path=std::string(tmp)+"/db";constexpr uint64_t gib=uint64_t{1}<<30,chunk=65536;
@@ -32,13 +33,15 @@ int main(){
             work.write("/replacement",{});work.truncate("/replacement",Namespace::maximum_file_size);work.rename("/replacement","/holes");work.snapshot("sameholes");
             check(fs.diff("holes","sameholes").find("\"content_changed\":true")==std::string::npos);
             auto stable=store.status();rejects([&]{work.write_at("/f",Namespace::maximum_file_size,Bytes{1});});
-            rejects([&]{work.truncate("/f",Namespace::maximum_file_size+1);});rejects([&]{work.append("/f",Bytes{1});});check(store.status()==stable);
+            rejects_errno([&]{work.truncate("/f",Namespace::maximum_file_size+1);},EFBIG);rejects([&]{work.append("/f",Bytes{1});});check(store.status()==stable);
             check(old.read_at("/f",4*gib+123,4)==Bytes({'D','A','T','A'}));rejects([&]{old.write_at("/f",0,Bytes{1});});
             auto fd=work.open("/f",Namespace::Access::ReadWrite);work.remove("/f",false);work.remove("/alias",false);
             check(work.handle_stat(fd).size==Namespace::maximum_file_size && work.handle_stat(fd).links==0);
             work.handle_write(fd,4*gib+123,Bytes{'O','P','E','N'});check(work.handle_read(fd,4*gib+123,4)==Bytes({'O','P','E','N'}));
             work.handle_truncate(fd,4*gib+125);work.handle_truncate(fd,5*gib);
-            check(work.handle_read(fd,4*gib+123,4)==Bytes({'O','P',0,0}));work.verify();work.close(fd);
+            check(work.handle_read(fd,4*gib+123,4)==Bytes({'O','P',0,0}));
+            stable=store.status();rejects_errno([&]{work.handle_truncate(fd,Namespace::maximum_file_size+1);},EFBIG);
+            check(store.status()==stable && work.handle_stat(fd).size==5*gib && work.handle_read(fd,4*gib+123,4)==Bytes({'O','P',0,0}));work.verify();work.close(fd);
             fs.truncate("/f",64*1024*1024);fs.truncate("/f",5*gib);
             check(fs.read_at("/f",64*1024*1024-2,4)==Bytes({'D','A',0,0}));check(fs.read_at("/f",4*gib+123,4)==Bytes(4,0));
             // Leave a large orphan for restart recovery (the handle is process-local).
