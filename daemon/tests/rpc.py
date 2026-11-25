@@ -196,6 +196,31 @@ with tempfile.TemporaryDirectory(prefix='ffrpc-',dir='/tmp') as tmp:
                        ['fs-read-at','/offset','0','18446744073709551616'],
                        ['fs-truncate','/offset',str((1<<40)+1)],['fs-truncate','/offset','1x'],
                        ['fs-write-at','/offset',str(1<<40),b'x']]:raw(fields,ok=False)
+        # Fill a sparse file to the exact limit and test all append paths.
+        maximum=1<<40
+        raw(['fs-write','/append-limit',b''])
+        raw(['fs-write-at','/append-limit',str(maximum-1),b'M'])
+        limit_handle=json.loads(cli('fs-open','/append-limit','rw,append'))['handle']
+        limit_dup=json.loads(raw(['fs-dup',limit_handle,'--session',session]))['handle']
+        assert json.loads(raw(['fs-hseek',limit_handle,'17','set']))['offset']==17
+        limit_seq=json.loads(raw(['status']))['last_committed_seq']
+        for fields in [['fs-append','/append-limit',b'!'],
+                       ['fs-happend',limit_handle,b'!'],
+                       ['fs-hwrite',limit_handle,'0',b'!'],
+                       ['fs-hwrite-next',limit_handle,b'!']]:
+            raw(fields,ok=False,expected_code=errno.EFBIG+1)
+            assert json.loads(raw(['status']))['last_committed_seq']==limit_seq
+            assert json.loads(raw(['fs-hseek',limit_dup,'0','cur']))['offset']==17
+            assert json.loads(raw(['fs-hstat',limit_dup]))['size']==maximum
+            assert raw(['fs-hread',limit_dup,str(maximum-1),'1'])==b'M'
+        assert json.loads(raw(['fs-append','/append-limit',b'']))=={'offset':maximum,'written':0}
+        assert json.loads(raw(['fs-happend',limit_handle,b'']))=={'offset':maximum,'written':0}
+        assert json.loads(raw(['fs-hwrite-next',limit_handle,b'']))=={'written':0}
+        assert json.loads(raw(['fs-hseek',limit_dup,'0','cur']))['offset']==17
+        assert json.loads(raw(['status']))['last_committed_seq']==limit_seq
+        assert json.loads(raw(['fs-stat','/append-limit']))['size']==maximum
+        assert raw(['fs-read-at','/append-limit',str(maximum-1),'1'])==b'M'
+        cli('fs-close',limit_dup);cli('fs-close',limit_handle)
         data.write_bytes(b'handle-original');cli('fs-write','/handle',data)
         handle=json.loads(cli('fs-open','/handle','rw'))['handle']
         second=json.loads(cli('fs-open','/handle','r'))['handle']

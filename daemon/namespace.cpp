@@ -428,7 +428,7 @@ public:
             if(!identical)throw std::system_error(EPERM,std::generic_category(),"append-only write must preserve existing data");
             if(value.size()<=n_.size-offset)return false;
         }
-        need(offset<=Namespace::maximum_file_size && value.size()<=Namespace::maximum_file_size-offset,"file exceeds 1 TiB");
+        if(offset>Namespace::maximum_file_size || value.size()>Namespace::maximum_file_size-offset)throw std::system_error(EFBIG,std::generic_category(),"file exceeds 1 TiB");
         auto end=offset+value.size();
         if(!n_.chunked && end<=Namespace::maximum_io_size) {
             auto data=get(inline_);need(data.size()==n_.size,"inode size mismatch");if(end>data.size())data.resize(end,0);

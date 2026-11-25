@@ -172,7 +172,7 @@ int main(){
             check(append_base.read("/append-test")==Bytes{'B'} && append_fork.read("/append-test")==Bytes{'B'});
             fs.write("/append-test",Bytes{'N'});check(fs.read("/append-test")==Bytes{'N'});
             fs.handle_truncate(appenders[0],forkfs::Namespace::maximum_file_size);stable=store.status();
-            rejects([&]{fs.handle_write(appenders[0],0,Bytes{1});});rejects([&]{fs.handle_write(appenders[0],UINT64_MAX,{});});
+            rejects_errno([&]{fs.handle_write(appenders[0],0,Bytes{1});},EFBIG);rejects([&]{fs.handle_write(appenders[0],UINT64_MAX,{});});
             fs.handle_write(appenders[0],0,{});check(store.status()==stable);
             for(const auto& h:appenders)fs.close(h);fs.remove("/append-test",false);fs.verify();
             fs.write("/cursor",Bytes{'a','b','c','d'});fs.link("/cursor","/cursor-alias");auto cursor=fs.open("/cursor",forkfs::Namespace::Access::ReadWrite);
