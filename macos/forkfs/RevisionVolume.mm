@@ -268,14 +268,14 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
             else{NSMutableDictionary* a=[replaced.attrs mutableCopy];auto links=[a[@"links"] unsignedLongLongValue];a[@"links"]=@(itemType(a)==FSItemTypeDirectory?0:links-1);replaced.attrs=a;}}
     }];reply(e?nil:newName,e);
 }
-- (void)loadDirectoryPage:(NSMutableDictionary*)stream directory:(RevisionItem*)dir {
+- (void)loadDirectoryPage:(NSMutableDictionary*)stream {
     uint64_t start=[stream[@"start"] unsignedLongLongValue]+[stream[@"entries"] count];
     NSDictionary* page=[self json:@[@"fs-dir-entries",stream[@"cursor"],@"512"]];NSArray* values=page[@"entries"];
     require([values isKindOfClass:NSArray.class] && values.count<=512 && page[@"eof"]!=nil,EPROTO,"invalid directory page");
     NSMutableArray* entries=[values mutableCopy];
     if(start==0 && [stream[@"dots"] boolValue]){
-        [entries insertObject:@{@"dotID":@(dir.parent),@"name":@".."} atIndex:0];
-        [entries insertObject:@{@"dotID":@(dir.number),@"name":@"."} atIndex:0];
+        [entries insertObject:@{@"dotID":stream[@"parentDotID"],@"name":@".."} atIndex:0];
+        [entries insertObject:@{@"dotID":stream[@"dotID"],@"name":@"."} atIndex:0];
     }
     require(entries.count>0 || [page[@"eof"] boolValue],EPROTO,"empty nonterminal directory page");
     stream[@"start"]=@(start);stream[@"entries"]=entries;stream[@"eof"]=page[@"eof"];
@@ -289,21 +289,21 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
             if(_streams.count>=64){NSNumber* oldest=[[_streams.allKeys sortedArrayUsingSelector:@selector(compare:)] firstObject];
                 [self json:@[@"fs-dir-close",_streams[oldest][@"cursor"]]];[_streams removeObjectForKey:oldest];}
             NSString* cursor=[self json:@[@"inode-dir-open",dir.inode]][@"cursor"];
-            stream=[@{@"directory":dir.inode,@"cursor":cursor,@"dots":@(withDots),@"attributes":@(attributes!=nil),@"start":@0,@"entries":@[]} mutableCopy];
-            try{[self loadDirectoryPage:stream directory:dir];}catch(...){try{[self json:@[@"fs-dir-close",cursor]];}catch(...){}throw;}
+            stream=[@{@"directory":dir.inode,@"cursor":cursor,@"dots":@(withDots),@"dotID":@(dir.number),@"parentDotID":@(dir.parent),@"attributes":@(attributes!=nil),@"start":@0,@"entries":@[]} mutableCopy];
+            try{[self loadDirectoryPage:stream];}catch(...){try{[self json:@[@"fs-dir-close",cursor]];}catch(...){}throw;}
             out=_nextStream++;_streams[@(out)]=stream;
         } else {stream=_streams[@(verifier)];require([stream[@"directory"] isEqual:dir.inode],ESTALE,"directory cookie belongs to another inode");
             require([stream[@"dots"] boolValue]==withDots && [stream[@"attributes"] boolValue]==(attributes!=nil),ESTALE,"directory cookie mode changed");
             if(cookie<[stream[@"start"] unsignedLongLongValue]){
                 [self json:@[@"fs-dir-rewind",stream[@"cursor"]]];stream[@"start"]=@0;stream[@"entries"]=@[];
-                [self loadDirectoryPage:stream directory:dir];
+                [self loadDirectoryPage:stream];
             }
         }
         uint64_t index=cookie;
         for(;;){NSArray* entries=stream[@"entries"];uint64_t start=[stream[@"start"] unsignedLongLongValue],end=start+entries.count;
             require(index>=start,ESTALE,"invalid directory cookie");
             if(index>=end){if([stream[@"eof"] boolValue]){require(index==end,ESTALE,"invalid directory cookie");break;}
-                [self loadDirectoryPage:stream directory:dir];continue;}
+                [self loadDirectoryPage:stream];continue;}
             NSDictionary* entry=entries[index-start];BOOL dot=entry[@"dotID"]!=nil;
             RevisionItem* it=nil;FSItemType type=FSItemTypeDirectory;FSItemID itemID;
             if(dot)itemID=(FSItemID)[entry[@"dotID"] unsignedLongLongValue];
