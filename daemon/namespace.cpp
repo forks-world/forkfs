@@ -1237,7 +1237,7 @@ void Namespace::allocation_info(InodeInfo& n,const NamespaceView& view) const {
 namespace {
 void valid_attributes(const Namespace::Attributes& a) {
     need(!a.mode || *a.mode<=supported_mode_bits,"unsupported mode bits");
-    need(!a.flags || !(*a.flags&~supported_file_flags),"unsupported file flags");
+    if(a.flags && (*a.flags&~supported_file_flags))throw std::system_error(ENOTSUP,std::generic_category(),"unsupported file flags");
     need(!a.size || *a.size<=Namespace::maximum_file_size,"file exceeds 1 TiB");
     need(!a.modified_ns || *a.modified_ns<=INT64_MAX,"mtime exceeds supported nanosecond range");
     need(!a.accessed_ns || *a.accessed_ns<=INT64_MAX,"atime exceeds supported nanosecond range");

@@ -39,6 +39,11 @@ uint64_t number(const std::string& text,int base=10){
     uint64_t value=0;auto parsed=std::from_chars(text.data(),text.data()+text.size(),value,base);
     need(parsed.ec==std::errc{} && parsed.ptr==text.data()+text.size(),"invalid file offset/count");return value;
 }
+uint32_t parse_file_flags(const std::string& text){
+    auto flags=number(text);
+    if(flags>UINT32_MAX || (flags&~uint64_t(supported_file_flags)))throw RpcError(ENOTSUP,"unsupported file flags");
+    return static_cast<uint32_t>(flags);
+}
 int64_t signed_number(const std::string& text){
     int64_t value=0;auto parsed=std::from_chars(text.data(),text.data()+text.size(),value);
     need(parsed.ec==std::errc{} && parsed.ptr==text.data()+text.size(),"invalid signed offset");return value;
@@ -317,7 +322,8 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
         size_t handle_index=5;
         if(op=="inode-setattr-times" || op=="inode-setattr-flags"){if(args[5]!="-")a.accessed_ns=number(args[5]);if(args[6]!="-")a.birth_ns=number(args[6]);handle_index=7;}
         if(op=="inode-setattr-flags"){
-            if(args[7]!="-"){auto flags=number(args[7]);need(flags<=UINT32_MAX && !(flags&~uint64_t(supported_file_flags)),"unsupported file flags");a.flags=static_cast<uint32_t>(flags);}handle_index=8;
+            if(args[7]!="-")a.flags=parse_file_flags(args[7]);
+            handle_index=8;
         }
         if(args[handle_index]!="-") {
             const auto& handle=args[handle_index];require_owned_handle(handle);
@@ -451,8 +457,8 @@ std::string dispatch(Container& store,Sessions& sessions,std::vector<std::string
         return "{\"offset\":"+std::to_string(offset)+",\"written\":"+std::to_string(args[2].size())+"}\n";
     }
     if(op=="fs-setflags" || op=="fs-lsetflags" || op=="fs-hsetflags") {
-        auto flags=number(args[2]);need(flags<=UINT32_MAX && !(flags&~uint64_t(supported_file_flags)),"unsupported file flags");
-        Namespace::Attributes a;a.flags=static_cast<uint32_t>(flags);
+        auto flags=parse_file_flags(args[2]);
+        Namespace::Attributes a;a.flags=flags;
         if(op=="fs-hsetflags")fs.handle_set_attributes(args[1],a);else if(op=="fs-lsetflags")fs.set_link_attributes(args[1],a);else fs.set_attributes(args[1],a);return store.status();
     }
     if(op=="fs-settimes" || op=="fs-lsettimes" || op=="fs-hsettimes") {

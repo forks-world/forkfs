@@ -208,6 +208,33 @@ with tempfile.TemporaryDirectory(prefix='ff-inode-',dir='/tmp') as tmp:
         rpc('fs-htruncate',handle,'7',*sel)
         st=obj('inode-setattr-flags',fid,'-','-','-','-','-','32769',handle,*sel)
         assert st['flags']==32769
+        # All public flag setters report unsupported masks consistently.
+        rpc('fs-write','/flags-probe',b'flag-data',*sel)
+        probe_handle=obj('fs-open','/flags-probe','rw',*sel)['handle']
+        rpc('fs-symlink','/missing-flags-target','/flags-dangling',*sel)
+        rpc('fs-setflags','/flags-probe','32769',*sel)
+        rpc('fs-lsetflags','/flags-dangling','32769',*sel)
+        assert obj('fs-hstat',probe_handle,*sel)['flags']==32769
+        assert obj('fs-lstat','/flags-dangling',*sel)['flags']==32769
+        flag_before=obj('fs-hstat',probe_handle,*sel)
+        link_before=obj('fs-lstat','/flags-dangling',*sel)
+        probe_seq=obj('status')['last_committed_seq']
+        for invalid in ('32777','4294967296'):
+            for operation in [('fs-setflags','/flags-probe',invalid),
+                              ('fs-lsetflags','/flags-dangling',invalid),
+                              ('fs-hsetflags',probe_handle,invalid)]:
+                rpc(*operation,*sel,error=errno.ENOTSUP)
+                assert obj('status')['last_committed_seq']==probe_seq
+                assert obj('fs-hstat',probe_handle,*sel)==flag_before
+                assert obj('fs-lstat','/flags-dangling',*sel)==link_before
+                assert rpc('fs-hread',probe_handle,'0','99',*sel)==b'flag-data'
+        rpc('fs-hsetflags',probe_handle,'32768',*sel)
+        assert obj('fs-hstat',probe_handle,*sel)['flags']==32768
+        rpc('fs-hsetflags',probe_handle,'32769',*sel)
+        assert obj('fs-hstat',probe_handle,*sel)['flags']==32769
+        rpc('fs-close',probe_handle,*sel)
+        rpc('fs-unlink','/flags-probe',*sel)
+        rpc('fs-unlink','/flags-dangling',*sel)
         flag_seq=obj('status')['last_committed_seq']
         for invalid in ['8','4294967297']:
             rpc('inode-setattr-flags',fid,str(0o777),'0','0','-','-',invalid,handle,*sel,error=errno.ENOTSUP)
