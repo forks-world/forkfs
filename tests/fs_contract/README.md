@@ -64,3 +64,5 @@ python3 scripts/tests/fs_contract.py --selftest
 ```
 
 CMake registers this infrastructure check as `fs_contract_harness_selftest`. The existing daemon tests remain registered separately and continue to run in full.
+
+For native directory-descriptor diagnostics, run `python3 scripts/tests/directory_fd_mount.py MOUNTPOINT` on an owned private forkfs mount root, or add `--reference-apfs` for an APFS reference directory. The JSON report separates descriptor metadata, xattr, and mkdir observations for removed, replaced, and renamed directories.
