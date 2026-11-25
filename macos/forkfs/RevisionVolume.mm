@@ -39,6 +39,7 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
 @property NSDictionary* attrs;
 @property NSString* reader;
 @property NSString* writer;
+@property BOOL detached;
 @end
 @implementation RevisionItem
 @end
@@ -236,7 +237,7 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
         require(mode<=forkfs::supported_mode_bits,ENOTSUP,"unsupported creation mode");
         require(type==FSItemTypeDirectory || type==FSItemTypeFIFO || type==FSItemTypeSocket || type==FSItemTypeFile,ENOTSUP,"unsupported creation type");
         NSString* filename=requiredFilename(name);NSDictionary* attrs;
-        if(type==FSItemTypeDirectory)attrs=[self json:@[@"inode-mkdir",dir.inode,filename,[@(mode) stringValue]]];
+        if(type==FSItemTypeDirectory){NSString* handle=dir.detached?[self handle:dir]:nil;attrs=[self json:@[handle?@"fs-hmkdir":@"inode-mkdir",handle?:dir.inode,filename,[@(mode) stringValue]]];}
         else if(type==FSItemTypeFIFO)attrs=[self json:@[@"inode-mkfifo",dir.inode,filename,[@(mode) stringValue]]];
         else if(type==FSItemTypeSocket)attrs=[self json:@[@"inode-mksocket",dir.inode,filename,[@(mode) stringValue]]];
         else {NSString* handle=[self json:@[@"inode-create",dir.inode,filename,[@(mode) stringValue]]][@"handle"];
@@ -255,6 +256,7 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
 - (void)removeItem:(FSItem*)item named:(FSFileName*)name fromDirectory:(FSItem*)directory replyHandler:(void(^)(NSError*))reply {
     NSError* e=[self perform:^{[self writable];auto it=[self item:item],dir=[self item:directory];
         auto type=itemType(it.attrs);NSString* filename=requiredFilename(name);[self json:@[@"inode-remove",dir.inode,filename,it.inode,type==FSItemTypeDirectory?@"directory":@"file"]];
+        if(type==FSItemTypeDirectory)it.detached=YES;
         if([self handle:it])[self refresh:it];else {NSMutableDictionary* a=[it.attrs mutableCopy];auto links=[a[@"links"] unsignedLongLongValue];a[@"links"]=@(itemType(a)==FSItemTypeDirectory?0:links-1);it.attrs=a;}
     }];reply(e);
 }
@@ -262,7 +264,7 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
     NSError* e=[self perform:^{[self writable];auto it=[self item:item],src=[self item:source],dst=[self item:destination];
         NSString* overInode=over?[self item:over].inode:@"-";NSString* filename=requiredFilename(name);NSString* destinationName=requiredFilename(newName);
         it.attrs=[self json:@[@"inode-rename",src.inode,filename,dst.inode,destinationName,it.inode,overInode]];it.parent=dst.number;
-        if(over && over!=item){auto replaced=[self item:over];if([self handle:replaced])[self refresh:replaced];
+        if(over && over!=item){auto replaced=[self item:over];if(itemType(replaced.attrs)==FSItemTypeDirectory)replaced.detached=YES;if([self handle:replaced])[self refresh:replaced];
             else{NSMutableDictionary* a=[replaced.attrs mutableCopy];auto links=[a[@"links"] unsignedLongLongValue];a[@"links"]=@(itemType(a)==FSItemTypeDirectory?0:links-1);replaced.attrs=a;}}
     }];reply(e?nil:newName,e);
 }
