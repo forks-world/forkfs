@@ -215,6 +215,8 @@ int main(int argc,char** argv){@autoreleasepool {
         [volume getXattrNamed:directoryXattr ofItem:retainedDirectory replyHandler:^(NSData* value,NSError* e){retainedDirectoryXattr=value;result=e;}];check(!result && [retainedDirectoryXattr isEqualToData:updatedDirectoryXattr],"recreated directory changed the orphan xattr");
         NSDictionary* beforeOrphanMkdir=[NSJSONSerialization JSONObjectWithData:command(binary,@[@"request",socket,@"status"]) options:0 error:nullptr];
         __block FSItem* orphanChild=nil;__block FSFileName* orphanChildName=nil;
+        [volume lookupItemNamed:[FSFileName nameWithString:@"child"] inDirectory:retainedDirectory replyHandler:^(FSItem* item,FSFileName* n,NSError* e){orphanChild=item;orphanChildName=n;result=e;}];check(result.code==ENOENT && !orphanChild && !orphanChildName,"lookup through removed pinned directory must fail with ENOENT");
+        [volume lookupItemNamed:invalidName inDirectory:retainedDirectory replyHandler:^(FSItem* item,FSFileName* n,NSError* e){orphanChild=item;orphanChildName=n;result=e;}];check(result.code==EINVAL && !orphanChild && !orphanChildName,"invalid lookup name must precede detached check");
         [volume createItemNamed:[FSFileName nameWithString:@"child"] type:FSItemTypeDirectory inDirectory:retainedDirectory attributes:[FSItemSetAttributesRequest new] replyHandler:^(FSItem* item,FSFileName* n,NSError* e){orphanChild=item;orphanChildName=n;result=e;}];
         check(result.code==ENOENT && !orphanChild && !orphanChildName,"mkdir through removed pinned directory must fail with ENOENT");
         NSDictionary* afterOrphanMkdir=[NSJSONSerialization JSONObjectWithData:command(binary,@[@"request",socket,@"status"]) options:0 error:nullptr];
@@ -222,6 +224,7 @@ int main(int argc,char** argv){@autoreleasepool {
         [volume lookupItemNamed:[FSFileName nameWithString:@"child"] inDirectory:reusedDirectory replyHandler:^(FSItem* item,FSFileName* n,NSError* e){orphanChild=item;result=e;}];check(result.code==ENOENT && !orphanChild,"orphan mkdir changed replacement directory");
         [volume closeItem:retainedDirectory keepingModes:0 replyHandler:^(NSError* e){result=e;}];check(!result,"last directory metadata pin close failed");
         [volume reclaimItem:retainedDirectory replyHandler:^(NSError* e){result=e;}];check(!result,"directory orphan reclaim failed");
+        [volume lookupItemNamed:[FSFileName nameWithString:@"child"] inDirectory:retainedDirectory replyHandler:^(FSItem* item,FSFileName* n,NSError* e){orphanChild=item;orphanChildName=n;result=e;}];check(result.code==ESTALE && !orphanChild && !orphanChildName,"reclaimed directory lookup must remain stale");
         [volume removeItem:reusedDirectory named:[FSFileName nameWithString:@"retained-dir"] fromDirectory:root replyHandler:^(NSError* e){result=e;}];check(!result,"recreated directory cleanup failed");
         [volume reclaimItem:reusedDirectory replyHandler:^(NSError* e){result=e;}];check(!result,"recreated directory reclaim failed");
         __block FSItem* overwrittenDirectory=nil;__block FSItem* replacementSource=nil;
@@ -231,6 +234,7 @@ int main(int argc,char** argv){@autoreleasepool {
         [volume renameItem:replacementSource inDirectory:root named:[FSFileName nameWithString:@"overwrite-source"] toNewName:[FSFileName nameWithString:@"overwrite-target"] inDirectory:root overItem:overwrittenDirectory replyHandler:^(FSFileName* n,NSError* e){result=e;}];check(!result,"pinned directory overwrite failed");
         NSDictionary* beforeOverwriteMkdir=[NSJSONSerialization JSONObjectWithData:command(binary,@[@"request",socket,@"status"]) options:0 error:nullptr];
         orphanChild=nil;orphanChildName=nil;
+        [volume lookupItemNamed:[FSFileName nameWithString:@"child"] inDirectory:overwrittenDirectory replyHandler:^(FSItem* item,FSFileName* n,NSError* e){orphanChild=item;orphanChildName=n;result=e;}];check(result.code==ENOENT && !orphanChild && !orphanChildName,"lookup through overwritten pinned directory must fail with ENOENT");
         [volume createItemNamed:[FSFileName nameWithString:@"child"] type:FSItemTypeDirectory inDirectory:overwrittenDirectory attributes:[FSItemSetAttributesRequest new] replyHandler:^(FSItem* item,FSFileName* n,NSError* e){orphanChild=item;orphanChildName=n;result=e;}];check(result.code==ENOENT && !orphanChild && !orphanChildName,"mkdir through overwritten pinned directory must fail with ENOENT");
         NSDictionary* afterOverwriteMkdir=[NSJSONSerialization JSONObjectWithData:command(binary,@[@"request",socket,@"status"]) options:0 error:nullptr];
         check(beforeOverwriteMkdir[@"last_committed_seq"] && [beforeOverwriteMkdir[@"last_committed_seq"] isEqual:afterOverwriteMkdir[@"last_committed_seq"]],"failed overwritten mkdir changed commit sequence");
