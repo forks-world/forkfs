@@ -240,18 +240,18 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
         if(type==FSItemTypeDirectory){NSString* handle=dir.detached?[self handle:dir]:nil;attrs=[self json:@[handle?@"fs-hmkdir":@"inode-mkdir",handle?:dir.inode,filename,[@(mode) stringValue]]];}
         else if(type==FSItemTypeFIFO)attrs=[self json:@[@"inode-mkfifo",dir.inode,filename,[@(mode) stringValue]]];
         else if(type==FSItemTypeSocket)attrs=[self json:@[@"inode-mksocket",dir.inode,filename,[@(mode) stringValue]]];
-        else {NSString* handle=[self json:@[@"inode-create",dir.inode,filename,[@(mode) stringValue]]][@"handle"];
+        else {require(!dir.detached,ENOENT,"directory is detached");NSString* handle=[self json:@[@"inode-create",dir.inode,filename,[@(mode) stringValue]]][@"handle"];
             @try{attrs=[self json:@[@"fs-hstat",handle]];}@finally{[self json:@[@"fs-close",handle]];}}
         result=[self remember:attrs parent:dir.number];request.consumedAttributes=[request isValid:FSItemAttributeMode]?FSItemAttributeMode:0;
     }];reply(result,e?nil:name,e);
 }
 - (void)createSymbolicLinkNamed:(FSFileName*)name inDirectory:(FSItem*)directory attributes:(FSItemSetAttributesRequest*)request linkContents:(FSFileName*)contents replyHandler:(void(^)(FSItem*,FSFileName*,NSError*))reply {
     __block RevisionItem* result=nil;NSError* e=[self perform:^{[self writable];auto dir=[self item:directory];
-        NSString* filename=requiredFilename(name);NSString* target=requiredFilename(contents);
+        NSString* filename=requiredFilename(name);NSString* target=requiredFilename(contents);require(!dir.detached,ENOENT,"directory is detached");
         result=[self remember:[self json:@[@"inode-symlink",dir.inode,filename,target]] parent:dir.number];request.consumedAttributes=0;}];reply(result,e?nil:name,e);
 }
 - (void)createLinkToItem:(FSItem*)item named:(FSFileName*)name inDirectory:(FSItem*)directory replyHandler:(void(^)(FSFileName*,NSError*))reply {
-    NSError* e=[self perform:^{[self writable];auto it=[self item:item],dir=[self item:directory];NSString* filename=requiredFilename(name);it.attrs=[self json:@[@"inode-link",it.inode,dir.inode,filename]];}];reply(e?nil:name,e);
+    NSError* e=[self perform:^{[self writable];auto it=[self item:item],dir=[self item:directory];NSString* filename=requiredFilename(name);require(!dir.detached,ENOENT,"directory is detached");it.attrs=[self json:@[@"inode-link",it.inode,dir.inode,filename]];}];reply(e?nil:name,e);
 }
 - (void)removeItem:(FSItem*)item named:(FSFileName*)name fromDirectory:(FSItem*)directory replyHandler:(void(^)(NSError*))reply {
     NSError* e=[self perform:^{[self writable];auto it=[self item:item],dir=[self item:directory];
@@ -262,7 +262,7 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
 }
 - (void)renameItem:(FSItem*)item inDirectory:(FSItem*)source named:(FSFileName*)name toNewName:(FSFileName*)newName inDirectory:(FSItem*)destination overItem:(FSItem*)over replyHandler:(void(^)(FSFileName*,NSError*))reply {
     NSError* e=[self perform:^{[self writable];auto it=[self item:item],src=[self item:source],dst=[self item:destination];
-        NSString* overInode=over?[self item:over].inode:@"-";NSString* filename=requiredFilename(name);NSString* destinationName=requiredFilename(newName);
+        NSString* overInode=over?[self item:over].inode:@"-";NSString* filename=requiredFilename(name);NSString* destinationName=requiredFilename(newName);require(!dst.detached,ENOENT,"directory is detached");
         it.attrs=[self json:@[@"inode-rename",src.inode,filename,dst.inode,destinationName,it.inode,overInode]];it.parent=dst.number;
         if(over && over!=item){auto replaced=[self item:over];if(itemType(replaced.attrs)==FSItemTypeDirectory)replaced.detached=YES;if([self handle:replaced])[self refresh:replaced];
             else{NSMutableDictionary* a=[replaced.attrs mutableCopy];auto links=[a[@"links"] unsignedLongLongValue];a[@"links"]=@(itemType(a)==FSItemTypeDirectory?0:links-1);replaced.attrs=a;}}
