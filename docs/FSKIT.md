@@ -42,6 +42,13 @@ logs belong outside source control. Temporary profile/entitlement files are
 removed when the script exits. The generated bundle embeds the profile, not a
 private key.
 
+If `codesign` returns `errSecInternalComponent` from a background session,
+check whether the system log reports `errSecInteractionNotAllowed` for the
+private-key operation. With that error, run the same bundle command from
+Terminal in the Mac's logged-in graphical session and respond to any Keychain
+prompt there. The November 26 build signed successfully when run in that
+session. See the [signed deployment record](evidence/2026-11-26-signed-fskit-deployment.json).
+
 Self-signed/ad-hoc signatures cannot authorize the restricted FSKit Module
 entitlement. Successful signing verifies the bundle's signature; OS enablement,
 sandbox-compatible daemon communication, and mount acceptance still need

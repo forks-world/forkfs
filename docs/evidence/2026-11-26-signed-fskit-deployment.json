@@ -1,0 +1,88 @@
+{
+  "date": "2026-11-26",
+  "source_commit": "02e1a123f5d1e1e2fef05a16ae61986c70c9cc59",
+  "environment": {
+    "macos": "27.2.1",
+    "build": "26B131",
+    "sdk": "27.2",
+    "architecture": "arm64"
+  },
+  "signing": {
+    "identity_kind": "Apple Development",
+    "background_error": "errSecInternalComponent",
+    "background_keychain_error": "errSecInteractionNotAllowed",
+    "signed_in_console_aqua_session": true,
+    "app_and_archive_signature_verified": true,
+    "signed_extension_sha256": "4b6712ee97660dd1b37739cd37224c0ab221fa5b2b08f360f5dda6fdcd1adc09",
+    "daemon_sha256": "874ca31d23ce7deb0a76f4262529747228eb5171de5d0087992971ba0ac17e68",
+    "deployment_archive_sha256": "e91e462ca141c83a032dd2c27acb16b57461c2d0cb934807946d7970dc4aa5e5",
+    "loaded_extension_verified_by_executable_inode": true
+  },
+  "results": {
+    "ctest": {
+      "passed": 87,
+      "total": 87
+    },
+    "native_smoke": {
+      "passed": 13,
+      "total": 13
+    },
+    "application_cases_passed": [
+      "append",
+      "flock",
+      "git",
+      "lockf",
+      "mmap",
+      "open-flags",
+      "permissions",
+      "relative-paths",
+      "sqlite-delete",
+      "sqlite-wal"
+    ],
+    "mmap_revision_isolation": true,
+    "read_only_revision_remount_preserved_bytes": true,
+    "read_only_revision_write_errno": "EROFS",
+    "offline_repository_check_passed": true,
+    "standalone_apfs": {
+      "passed": 56,
+      "total": 56
+    }
+  },
+  "paired_contract": {
+    "case_corpus_sha256": "380c580f846ed2ecc2a70495be18ac3657053aafb89cb7bc85d231796a9ecbfb",
+    "coverage_sha256": "53967a2f01e2eb62fb4fbd801dc04dd425e66540c2e3a9991ad4570ca3311308",
+    "cases_per_filesystem": 54,
+    "runs": [
+      {
+        "report_sha256": "6218d7193e9f6498569eb281c47de3f9808e421fd538fc066408c5171b72cd82",
+        "apfs_passed": 54,
+        "forkfs_passed": 53,
+        "failed_step": {
+          "case_id": "directory_handle_relative_create_survives_rename_and_path_reuse",
+          "index": 10,
+          "operation": "mkdir_at",
+          "apfs_errno": "ENOENT",
+          "forkfs_errno": "ESTALE",
+          "forkfs_errno_number": 70,
+          "fingerprint_before_sha256": "3addbcb60f6d6fc41d0c25c30557f634f65899a5b0b93053feff39751b071f9e",
+          "fingerprint_after_sha256": "3addbcb60f6d6fc41d0c25c30557f634f65899a5b0b93053feff39751b071f9e"
+        }
+      },
+      {
+        "report_sha256": "3ef3ec1c4088c303407b6badc702b1f885a0ee189a9c0dd6df764ac74e7d862f",
+        "apfs_passed": 54,
+        "forkfs_passed": 53,
+        "failed_step": {
+          "case_id": "directory_handle_relative_create_survives_rename_and_path_reuse",
+          "index": 10,
+          "operation": "mkdir_at",
+          "apfs_errno": "ENOENT",
+          "forkfs_errno": "ESTALE",
+          "forkfs_errno_number": 70,
+          "fingerprint_before_sha256": "62c4474bcc8627e14e6dbd5e7538959825cd7a5cab0d3b15784820c2d96dff9f",
+          "fingerprint_after_sha256": "62c4474bcc8627e14e6dbd5e7538959825cd7a5cab0d3b15784820c2d96dff9f"
+        }
+      }
+    ]
+  }
+}

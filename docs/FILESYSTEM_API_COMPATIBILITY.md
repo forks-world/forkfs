@@ -20,6 +20,11 @@ Apple 的 [FSVolume](https://developer.apple.com/documentation/fskit/fsvolume)
 - **未验收**：尚无足够证据；不等同于已证实失败。
 - **缺失/受限**：明确的实现缺口或产品限制。
 
+macOS 27.2.1 上，main `02e1a12` 的同提交签名扩展和 daemon 已通过实挂载。
+两次契约对照均为 APFS 54/54、ForkFS 53/54。已删除目录 fd 上的
+`mkdirat` 仍返回 `ESTALE`，APFS 返回 `ENOENT`。
+[签名部署记录](evidence/2026-11-26-signed-fskit-deployment.json)
+
 后续工作和验收顺序见[兼容性路线图](FILESYSTEM_COMPATIBILITY_ROADMAP.md)。
 
 ## API 清单
