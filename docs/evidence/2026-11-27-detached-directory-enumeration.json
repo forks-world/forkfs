@@ -1,0 +1,32 @@
+{
+  "date": "2026-11-27",
+  "macos": "27.2.1",
+  "sdk": "27.2",
+  "source_commit": "0708266039c203c85847da71b7d16207aa5921b6",
+  "signed_extension_sha256": "ed7e11e042ee11b64174d1c5c2e12f5614b144e1e60856c93c75b7feebed83c4",
+  "daemon_sha256": "874ca31d23ce7deb0a76f4262529747228eb5171de5d0087992971ba0ac17e68",
+  "verified_running_extension": true,
+  "baseline_signed_commit": "9db0319bb66f2b28035a710cbf27acc03c2169f6",
+  "raw_readdir": {
+    "after": [
+      "rmdir_reuse",
+      "rename_replace"
+    ],
+    "baseline_forkfs_errno": "ESTALE",
+    "candidate_forkfs_and_apfs_entries": 0,
+    "candidate_forkfs_and_apfs_errno": 0
+  },
+  "directory_probe": {
+    "passed": 3,
+    "total": 3,
+    "candidate_report_sha256": "ea455ba4bdf179aca8a90bd82814fef38bdd1b304b1c6c5ac384546b12c9506d",
+    "baseline_report_sha256": "93b40353bd9860f0a387cfd7778e9605d160a5fa567d6ef4160df8151802cc85"
+  },
+  "paired_contract": {
+    "apfs_passed": 54,
+    "forkfs_passed": 54,
+    "case_corpus_sha256": "380c580f846ed2ecc2a70495be18ac3657053aafb89cb7bc85d231796a9ecbfb",
+    "coverage_sha256": "53967a2f01e2eb62fb4fbd801dc04dd425e66540c2e3a9991ad4570ca3311308",
+    "report_sha256": "4108513233ef9ae18f9558a61c988659e8841590f2a9ec488833817ba488339a"
+  }
+}
