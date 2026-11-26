@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Measure directory descriptor behavior on APFS or an owned forkfs mount."""
 import argparse
+import ctypes
 import errno
 import json
 import os
@@ -19,6 +20,34 @@ from tests.fs_contract.adapters import _DarwinXattr
 ATTR = 'user.forkfs-directory-fd'
 ORIGINAL = b'original\x00value'
 REPLACEMENT = b'replacement\x00value'
+
+
+def raw_directory_entry_count(fd):
+    libc = ctypes.CDLL('/usr/lib/libSystem.B.dylib', use_errno=True)
+    libc.fdopendir.argtypes = [ctypes.c_int]
+    libc.fdopendir.restype = ctypes.c_void_p
+    libc.readdir.argtypes = [ctypes.c_void_p]
+    libc.readdir.restype = ctypes.c_void_p
+    libc.closedir.argtypes = [ctypes.c_void_p]
+    libc.closedir.restype = ctypes.c_int
+    duplicate = os.dup(fd)
+    stream = libc.fdopendir(duplicate)
+    if not stream:
+        code = ctypes.get_errno()
+        os.close(duplicate)
+        raise OSError(code, os.strerror(code))
+    try:
+        count = 0
+        while True:
+            ctypes.set_errno(0)
+            if not libc.readdir(stream):
+                code = ctypes.get_errno()
+                if code:
+                    raise OSError(code, os.strerror(code))
+                return count
+            count += 1
+    finally:
+        libc.closedir(stream)
 
 
 def worker(root, scenario):
@@ -84,6 +113,8 @@ def worker(root, scenario):
         probe('fd_list_xattrs', {'errno': 0, 'value': True}, lambda: ATTR in xattr.fd_list(fd))
         probe('fd_get_xattr', {'errno': 0, 'value': ORIGINAL.hex()}, lambda: xattr.fd_get(fd, ATTR).hex())
         detached = scenario != 'live_rename_reuse'
+        if detached:
+            probe('raw_readdir_count', {'errno': 0, 'value': 0}, lambda: raw_directory_entry_count(fd))
         if not detached:
             probe('moved_identity_before_mkdir', {'errno': 0, 'value': expected_identity}, lambda: identity(os.stat(target)))
         probe('mkdirat', {'errno': errno.ENOENT if detached else 0}, lambda: os.mkdir('child', 0o700, dir_fd=fd))

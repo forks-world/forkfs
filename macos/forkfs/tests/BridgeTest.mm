@@ -295,6 +295,38 @@ int main(int argc,char** argv){@autoreleasepool {
         [volume enumerateDirectory:root startingAtCookie:FSDirectoryCookieInitial verifier:attributeVerifier providingAttributes:[FSItemGetAttributesRequest new] usingPacker:(FSDirectoryEntryPacker*)attributePacker replyHandler:^(FSDirectoryVerifier verifier,NSError* e){attributeVerifier=verifier;enumerationError=e;}];
         check(!enumerationError && attributePacker.entries.count==1 && [attributePacker.entries[0][@"name"] isEqual:@"文件📄"],"attribute directory enumeration must omit dot entries");
         check([attributePacker.entries[0][@"hasAttributes"] boolValue],"requested directory attributes were not supplied");
+        // Fresh streams on detached directory items are empty, while an older
+        // stream retains its snapshot and dot identities.
+        __block FSItem* enumRemoved=nil;__block FSItem* enumOverwritten=nil;__block FSItem* enumReplacement=nil;
+        [volume createItemNamed:[FSFileName nameWithString:@"enum-removed"] type:FSItemTypeDirectory inDirectory:root attributes:[FSItemSetAttributesRequest new] replyHandler:^(FSItem* item,FSFileName* n,NSError* e){enumRemoved=item;result=e;}];check(enumRemoved && !result,"detached enum directory creation failed");
+        [volume openItem:enumRemoved withModes:FSVolumeOpenModesRead replyHandler:^(NSError* e){result=e;}];check(!result,"detached enum pin failed");
+        RecordingPacker* oldEnum=[RecordingPacker new];oldEnum.limit=1;__block FSDirectoryVerifier oldEnumVerifier=FSDirectoryVerifierInitial;__block NSError* detachedEnumError=nil;
+        [volume enumerateDirectory:enumRemoved startingAtCookie:FSDirectoryCookieInitial verifier:oldEnumVerifier providingAttributes:nil usingPacker:(FSDirectoryEntryPacker*)oldEnum replyHandler:^(FSDirectoryVerifier v,NSError* e){oldEnumVerifier=v;detachedEnumError=e;}];check(!detachedEnumError,"pre-detach enum failed");
+        FSDirectoryCookie oldEnumCookie=expectDots?[oldEnum.entries.lastObject[@"cookie"] unsignedLongLongValue]:0;
+        [volume removeItem:enumRemoved named:[FSFileName nameWithString:@"enum-removed"] fromDirectory:root replyHandler:^(NSError* e){result=e;}];check(!result,"detached enum rmdir failed");
+        if(expectDots){oldEnum.packedThisCall=0;
+            [volume enumerateDirectory:enumRemoved startingAtCookie:oldEnumCookie verifier:oldEnumVerifier providingAttributes:nil usingPacker:(FSDirectoryEntryPacker*)oldEnum replyHandler:^(FSDirectoryVerifier v,NSError* e){oldEnumVerifier=v;detachedEnumError=e;}];
+            check(!detachedEnumError && oldEnum.entries.count==2 && [oldEnum.entries[1][@"name"] isEqual:@".."] && [oldEnum.entries[1][@"id"] unsignedLongLongValue]==rootAttrs.fileID,"pre-detach dot snapshot changed");}
+        [volume createItemNamed:[FSFileName nameWithString:@"enum-overwritten"] type:FSItemTypeDirectory inDirectory:root attributes:[FSItemSetAttributesRequest new] replyHandler:^(FSItem* item,FSFileName* n,NSError* e){enumOverwritten=item;result=e;}];check(enumOverwritten && !result,"enum overwrite target create failed");
+        [volume openItem:enumOverwritten withModes:FSVolumeOpenModesRead replyHandler:^(NSError* e){result=e;}];check(!result,"enum overwrite pin failed");
+        [volume createItemNamed:[FSFileName nameWithString:@"enum-replacement"] type:FSItemTypeDirectory inDirectory:root attributes:[FSItemSetAttributesRequest new] replyHandler:^(FSItem* item,FSFileName* n,NSError* e){enumReplacement=item;result=e;}];check(enumReplacement && !result,"enum replacement create failed");
+        [volume renameItem:enumReplacement inDirectory:root named:[FSFileName nameWithString:@"enum-replacement"] toNewName:[FSFileName nameWithString:@"enum-overwritten"] inDirectory:root overItem:enumOverwritten replyHandler:^(FSFileName* n,NSError* e){result=e;}];check(!result,"enum target overwrite failed");
+        for(FSItem* detached in @[enumRemoved,enumOverwritten])for(int mode=0;mode<2;++mode){
+            RecordingPacker* empty=[RecordingPacker new];empty.limit=8;__block FSDirectoryVerifier emptyVerifier=FSDirectoryVerifierInitial;__block NSError* emptyError=nil;
+            FSItemGetAttributesRequest* request=mode?[FSItemGetAttributesRequest new]:nil;
+            [volume enumerateDirectory:detached startingAtCookie:FSDirectoryCookieInitial verifier:emptyVerifier providingAttributes:request usingPacker:(FSDirectoryEntryPacker*)empty replyHandler:^(FSDirectoryVerifier v,NSError* e){emptyVerifier=v;emptyError=e;}];
+            check(!emptyError && emptyVerifier!=FSDirectoryVerifierInitial && empty.entries.count==0,"fresh detached enum must be empty");
+            [volume enumerateDirectory:detached startingAtCookie:1 verifier:emptyVerifier providingAttributes:request usingPacker:(FSDirectoryEntryPacker*)empty replyHandler:^(FSDirectoryVerifier v,NSError* e){emptyError=e;}];check(emptyError.code==ESTALE && empty.entries.count==0,"detached enum accepted nonzero cookie");
+        }
+        // Force eviction of local streams as well as real daemon cursors.
+        for(unsigned i=0;i<140;++i){RecordingPacker* empty=[RecordingPacker new];empty.limit=1;__block NSError* emptyError=nil;
+            [volume enumerateDirectory:enumRemoved startingAtCookie:FSDirectoryCookieInitial verifier:FSDirectoryVerifierInitial providingAttributes:nil usingPacker:(FSDirectoryEntryPacker*)empty replyHandler:^(FSDirectoryVerifier v,NSError* e){emptyError=e;}];check(!emptyError && empty.entries.count==0,"detached enum eviction failed");}
+        [volume closeItem:enumRemoved keepingModes:0 replyHandler:^(NSError* e){result=e;}];check(!result,"detached enum close failed");
+        [volume reclaimItem:enumRemoved replyHandler:^(NSError* e){result=e;}];check(!result,"detached enum reclaim failed");
+        [volume enumerateDirectory:enumRemoved startingAtCookie:FSDirectoryCookieInitial verifier:FSDirectoryVerifierInitial providingAttributes:nil usingPacker:(FSDirectoryEntryPacker*)[RecordingPacker new] replyHandler:^(FSDirectoryVerifier v,NSError* e){result=e;}];check(result.code==ESTALE,"reclaimed detached enum must remain stale");
+        [volume closeItem:enumOverwritten keepingModes:0 replyHandler:^(NSError* e){result=e;}];check(!result,"overwritten enum close failed");
+        [volume reclaimItem:enumOverwritten replyHandler:^(NSError* e){result=e;}];check(!result,"overwritten enum reclaim failed");
+        [volume removeItem:enumReplacement named:[FSFileName nameWithString:@"enum-overwritten"] fromDirectory:root replyHandler:^(NSError* e){result=e;}];check(!result,"enum replacement cleanup failed");
         __block FSItem* childDirectory=nil;
         [volume createItemNamed:[FSFileName nameWithString:@"child"] type:FSItemTypeDirectory inDirectory:root attributes:[FSItemSetAttributesRequest new] replyHandler:^(FSItem* item,FSFileName* n,NSError* e){childDirectory=item;result=e;}];check(childDirectory && !result,"test directory creation failed");
         RecordingPacker* stalePacker=[RecordingPacker new];stalePacker.limit=1;stalePacker.packedThisCall=0;
