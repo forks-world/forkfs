@@ -213,6 +213,31 @@ int main(int argc,char** argv){@autoreleasepool {
         [volume createItemNamed:[FSFileName nameWithString:@"retained-dir"] type:FSItemTypeDirectory inDirectory:root attributes:[FSItemSetAttributesRequest new] replyHandler:^(FSItem* item,FSFileName* n,NSError* e){reusedDirectory=item;result=e;}];check(reusedDirectory && !result,"directory pathname reuse failed");
         [volume getAttributes:[FSItemGetAttributesRequest new] ofItem:reusedDirectory replyHandler:^(FSItemAttributes* a,NSError* e){retainedDirectoryAttrs=a;result=e;}];check(!result && retainedDirectoryAttrs.fileID!=oldDirectoryID,"recreated directory reused the old inode identity");
         [volume getXattrNamed:directoryXattr ofItem:retainedDirectory replyHandler:^(NSData* value,NSError* e){retainedDirectoryXattr=value;result=e;}];check(!result && [retainedDirectoryXattr isEqualToData:updatedDirectoryXattr],"recreated directory changed the orphan xattr");
+        __block FSItem* mutationSource=nil;__block FSItemAttributes* mutationAttrs=nil;__block size_t mutationCount=0;
+        FSFileName* mutationSourceName=[FSFileName nameWithString:@"detached-source"];
+        [volume createItemNamed:mutationSourceName type:FSItemTypeFile inDirectory:root attributes:[FSItemSetAttributesRequest new] replyHandler:^(FSItem* item,FSFileName* n,NSError* e){mutationSource=item;result=e;}];check(mutationSource && !result,"detached mutation source create failed");
+        [volume openItem:mutationSource withModes:FSVolumeOpenModesRead|FSVolumeOpenModesWrite replyHandler:^(NSError* e){result=e;}];check(!result,"detached mutation source open failed");
+        [volume writeContents:[NSData dataWithBytes:"data" length:4] toFile:mutationSource atOffset:0 replyHandler:^(size_t count,NSError* e){mutationCount=count;result=e;}];check(!result && mutationCount==4,"detached mutation source write failed");
+        [volume getAttributes:[FSItemGetAttributesRequest new] ofItem:mutationSource replyHandler:^(FSItemAttributes* a,NSError* e){mutationAttrs=a;result=e;}];check(!result && mutationAttrs,"detached mutation source attributes failed");
+        FSItemID mutationSourceID=mutationAttrs.fileID;uint64_t mutationLinks=mutationAttrs.linkCount;
+        void (^checkDetachedMutations)(FSItem*,FSItem*)=^(FSItem* detached,FSItem* replacement){
+            NSDictionary* before=[NSJSONSerialization JSONObjectWithData:command(binary,@[@"request",socket,@"status"]) options:0 error:nullptr];
+            __block FSItem* child=nil;__block FSFileName* returned=nil;
+            [volume createItemNamed:[FSFileName nameWithString:@"new-file"] type:FSItemTypeFile inDirectory:detached attributes:[FSItemSetAttributesRequest new] replyHandler:^(FSItem* item,FSFileName* n,NSError* e){child=item;returned=n;result=e;}];check(result.code==ENOENT && !child && !returned,"file create in detached directory must fail with ENOENT");
+            [volume createSymbolicLinkNamed:[FSFileName nameWithString:@"new-symlink"] inDirectory:detached attributes:[FSItemSetAttributesRequest new] linkContents:[FSFileName nameWithString:@"target"] replyHandler:^(FSItem* item,FSFileName* n,NSError* e){child=item;returned=n;result=e;}];check(result.code==ENOENT && !child && !returned,"symlink in detached directory must fail with ENOENT");
+            [volume createLinkToItem:mutationSource named:[FSFileName nameWithString:@"new-link"] inDirectory:detached replyHandler:^(FSFileName* n,NSError* e){returned=n;result=e;}];check(result.code==ENOENT && !returned,"hardlink in detached directory must fail with ENOENT");
+            [volume renameItem:mutationSource inDirectory:root named:mutationSourceName toNewName:[FSFileName nameWithString:@"new-rename"] inDirectory:detached overItem:nil replyHandler:^(FSFileName* n,NSError* e){returned=n;result=e;}];check(result.code==ENOENT && !returned,"rename into detached directory must fail with ENOENT");
+            NSDictionary* after=[NSJSONSerialization JSONObjectWithData:command(binary,@[@"request",socket,@"status"]) options:0 error:nullptr];
+            check(before[@"last_committed_seq"] && [before[@"last_committed_seq"] isEqual:after[@"last_committed_seq"]],"detached mutations changed commit sequence");
+            for(NSString* name in @[@"new-file",@"new-symlink",@"new-link",@"new-rename"]){
+                [volume lookupItemNamed:[FSFileName nameWithString:name] inDirectory:replacement replyHandler:^(FSItem* item,FSFileName* n,NSError* e){child=item;returned=n;result=e;}];check(result.code==ENOENT && !child && !returned,"detached mutation changed replacement directory");
+            }
+            [volume lookupItemNamed:mutationSourceName inDirectory:root replyHandler:^(FSItem* item,FSFileName* n,NSError* e){child=item;result=e;}];check(!result && child==mutationSource,"detached mutation moved source");
+            [volume getAttributes:[FSItemGetAttributesRequest new] ofItem:mutationSource replyHandler:^(FSItemAttributes* a,NSError* e){mutationAttrs=a;result=e;}];check(!result && mutationAttrs.fileID==mutationSourceID && mutationAttrs.linkCount==mutationLinks && mutationAttrs.size==4,"detached mutation changed source identity or links");
+            TestBuffer* mutationBuffer=[TestBuffer new];mutationBuffer.storage=[NSMutableData dataWithLength:4];
+            [volume readFromFile:mutationSource offset:0 length:4 intoBuffer:(FSMutableFileDataBuffer*)mutationBuffer replyHandler:^(size_t count,NSError* e){mutationCount=count;result=e;}];check(!result && mutationCount==4 && !memcmp(mutationBuffer.storage.bytes,"data",4),"detached mutation changed source data");
+        };
+        checkDetachedMutations(retainedDirectory,reusedDirectory);
         NSDictionary* beforeOrphanMkdir=[NSJSONSerialization JSONObjectWithData:command(binary,@[@"request",socket,@"status"]) options:0 error:nullptr];
         __block FSItem* orphanChild=nil;__block FSFileName* orphanChildName=nil;
         [volume lookupItemNamed:[FSFileName nameWithString:@"child"] inDirectory:retainedDirectory replyHandler:^(FSItem* item,FSFileName* n,NSError* e){orphanChild=item;orphanChildName=n;result=e;}];check(result.code==ENOENT && !orphanChild && !orphanChildName,"lookup through removed pinned directory must fail with ENOENT");
@@ -232,6 +257,7 @@ int main(int argc,char** argv){@autoreleasepool {
         [volume openItem:overwrittenDirectory withModes:FSVolumeOpenModesRead replyHandler:^(NSError* e){result=e;}];check(!result,"overwrite target pin failed");
         [volume createItemNamed:[FSFileName nameWithString:@"overwrite-source"] type:FSItemTypeDirectory inDirectory:root attributes:[FSItemSetAttributesRequest new] replyHandler:^(FSItem* item,FSFileName* n,NSError* e){replacementSource=item;result=e;}];check(replacementSource && !result,"overwrite source create failed");
         [volume renameItem:replacementSource inDirectory:root named:[FSFileName nameWithString:@"overwrite-source"] toNewName:[FSFileName nameWithString:@"overwrite-target"] inDirectory:root overItem:overwrittenDirectory replyHandler:^(FSFileName* n,NSError* e){result=e;}];check(!result,"pinned directory overwrite failed");
+        checkDetachedMutations(overwrittenDirectory,replacementSource);
         NSDictionary* beforeOverwriteMkdir=[NSJSONSerialization JSONObjectWithData:command(binary,@[@"request",socket,@"status"]) options:0 error:nullptr];
         orphanChild=nil;orphanChildName=nil;
         [volume lookupItemNamed:[FSFileName nameWithString:@"child"] inDirectory:overwrittenDirectory replyHandler:^(FSItem* item,FSFileName* n,NSError* e){orphanChild=item;orphanChildName=n;result=e;}];check(result.code==ENOENT && !orphanChild && !orphanChildName,"lookup through overwritten pinned directory must fail with ENOENT");
@@ -242,6 +268,8 @@ int main(int argc,char** argv){@autoreleasepool {
         [volume closeItem:overwrittenDirectory keepingModes:0 replyHandler:^(NSError* e){result=e;}];check(!result,"overwritten directory pin close failed");
         [volume reclaimItem:overwrittenDirectory replyHandler:^(NSError* e){result=e;}];check(!result,"overwritten directory reclaim failed");
         [volume removeItem:replacementSource named:[FSFileName nameWithString:@"overwrite-target"] fromDirectory:root replyHandler:^(NSError* e){result=e;}];check(!result,"overwrite replacement cleanup failed");
+        [volume closeItem:mutationSource keepingModes:0 replyHandler:^(NSError* e){result=e;}];check(!result,"detached mutation source close failed");
+        [volume removeItem:mutationSource named:mutationSourceName fromDirectory:root replyHandler:^(NSError* e){result=e;}];check(!result,"detached mutation source cleanup failed");
         __block FSItem* pinnedMoved=nil;__block FSItem* pinnedReplacement=nil;__block FSItem* pinnedChild=nil;
         [volume createItemNamed:[FSFileName nameWithString:@"pin-source"] type:FSItemTypeDirectory inDirectory:root attributes:[FSItemSetAttributesRequest new] replyHandler:^(FSItem* item,FSFileName* n,NSError* e){pinnedMoved=item;result=e;}];check(pinnedMoved && !result,"pinned move directory create failed");
         [volume openItem:pinnedMoved withModes:FSVolumeOpenModesRead replyHandler:^(NSError* e){result=e;}];check(!result,"pinned move open failed");

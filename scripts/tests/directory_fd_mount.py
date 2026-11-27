@@ -87,6 +87,32 @@ def worker(root, scenario):
         if not detached:
             probe('moved_identity_before_mkdir', {'errno': 0, 'value': expected_identity}, lambda: identity(os.stat(target)))
         probe('mkdirat', {'errno': errno.ENOENT if detached else 0}, lambda: os.mkdir('child', 0o700, dir_fd=fd))
+        if detached:
+            fixture = root / 'mutation-source'
+            fixture.write_bytes(b'detached-source\x00bytes')
+
+            def source_state():
+                st = fixture.stat()
+                return {'dev': st.st_dev, 'ino': st.st_ino, 'nlink': st.st_nlink,
+                        'bytes': fixture.read_bytes().hex()}
+
+            source_initial = source_state()
+
+            def create_at():
+                created = os.open('created', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=fd)
+                os.close(created)
+
+            probe('openat_create', {'errno': errno.ENOENT}, create_at)
+            probe('symlinkat', {'errno': errno.ENOENT}, lambda: os.symlink('destination', 'symlink', dir_fd=fd))
+            probe('linkat', {'errno': errno.ENOENT}, lambda: os.link(fixture, 'linked', dst_dir_fd=fd))
+            probe('source_after_linkat', {'errno': 0, 'value': source_initial}, source_state)
+            probe('renameat', {'errno': errno.ENOENT}, lambda: os.rename(fixture, 'renamed', dst_dir_fd=fd))
+            probe('source_after_renameat', {'errno': 0, 'value': source_initial}, source_state)
+            probe('detached_identity_after_mutations', {'errno': 0, 'value': expected_identity},
+                  lambda: identity(os.fstat(fd)))
+            for name in ('created', 'symlink', 'linked', 'renamed'):
+                probe('replacement_' + name, {'errno': errno.ENOENT},
+                      lambda name=name: identity(os.lstat(replacement / name)))
         probe('replacement_stat', {'errno': 0, 'value': replacement_initial}, lambda: identity(os.stat(replacement)))
         probe('replacement_xattr', {'errno': 0, 'value': REPLACEMENT.hex()}, lambda: xattr.get(replacement, ATTR).hex())
         probe('replacement_child', {'errno': errno.ENOENT}, lambda: identity(os.stat(replacement / 'child')))
