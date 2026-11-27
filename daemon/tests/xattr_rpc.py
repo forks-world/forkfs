@@ -42,6 +42,11 @@ for binary in [BIN,LEGACY]:
                 assert select.select([proc.stdout],[],[],5)[0];assert json.loads(proc.stdout.readline())['state']=='leveldb'
                 session=json.loads(rpc('session-open',60000))['session'];sel=('--session',session)
                 rid=json.loads(rpc('inode-root',*sel))['inode']['inode_id'];fid=json.loads(rpc('inode-lookup',rid,'f',*sel))['inode_id']
+                sequence=json.loads(rpc('status'))['last_committed_seq']
+                rpc('fs-xattr-list','/missing',*sel,code=errno.ENOENT+1)
+                rpc('fs-xattr-list','/f/child',*sel,code=errno.ENOTDIR+1)
+                assert json.loads(rpc('status'))['last_committed_seq']==sequence
+                assert rpc('fs-xattr-get','/f','user.test',*sel)==payload
                 # The path and handle xattr APIs must preserve the POSIX existence errno.
                 rpc('fs-xattr-get','/f','absent',*sel,code=MISSING+1)
                 rpc('fs-xattr-remove','/f','absent',*sel,code=MISSING+1)
