@@ -1127,7 +1127,8 @@
           "script": "scripts/tests/locking_mount.py",
           "status": "not_run",
           "scenarios": [
-            "flock and lockf child-process conflict, release, blocking and interruption cases"
+            "flock and lockf child-process conflict, release, blocking and interruption cases",
+            "ofd capability probe: duplicate and independent descriptors, GETLK owner and range, disjoint range and last-close release"
           ]
         },
         {
