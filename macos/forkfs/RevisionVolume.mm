@@ -220,7 +220,7 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
         a=[self attributes:it];}];reply(a,e);
 }
 - (void)lookupItemNamed:(FSFileName*)name inDirectory:(FSItem*)directory replyHandler:(void(^)(FSItem*,FSFileName*,NSError*))reply {
-    __block RevisionItem* it=nil;NSError* e=[self perform:^{auto dir=[self item:directory];NSString* filename=requiredFilename(name);it=[self remember:[self json:@[@"inode-lookup",dir.inode,filename]] parent:dir.number];}];reply(it,e?nil:name,e);
+    __block RevisionItem* it=nil;NSError* e=[self perform:^{auto dir=[self item:directory];NSString* filename=requiredFilename(name);require(!dir.detached,ENOENT,"directory is detached");it=[self remember:[self json:@[@"inode-lookup",dir.inode,filename]] parent:dir.number];}];reply(it,e?nil:name,e);
 }
 - (void)reclaimItem:(FSItem*)item replyHandler:(void(^)(NSError*))reply {
     NSError* e=[self perform:^{auto it=[self item:item];require(!it.reader && !it.writer,EBUSY,"reclaim of open inode");

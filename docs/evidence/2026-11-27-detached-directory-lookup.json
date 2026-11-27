@@ -1,0 +1,45 @@
+{
+  "date": "2026-11-27",
+  "macos": "27.2.1",
+  "sdk": "27.2",
+  "source_commit": "9db0319bb66f2b28035a710cbf27acc03c2169f6",
+  "signed_extension_sha256": "f3af3ff8064d26849dfe9945c43f873d53aacf534cd98ecdf6034e5087abada5",
+  "daemon_sha256": "874ca31d23ce7deb0a76f4262529747228eb5171de5d0087992971ba0ac17e68",
+  "running_extension_inode_verified": true,
+  "baseline": {
+    "source_commit": "02e1a123f5d1e1e2fef05a16ae61986c70c9cc59",
+    "lookup_callback_received_valid_detached_pinned_item": true,
+    "lookup_callback_errno": "ESTALE",
+    "create_callback_reached_for_removed_parent": false
+  },
+  "directory_descriptor_probe": [
+    {
+      "scenario": "rmdir_reuse",
+      "passed": true,
+      "mkdirat_errno": 2
+    },
+    {
+      "scenario": "rename_replace",
+      "passed": true,
+      "mkdirat_errno": 2
+    },
+    {
+      "scenario": "live_rename_reuse",
+      "passed": true,
+      "mkdirat_errno": 0
+    }
+  ],
+  "paired_contract": {
+    "reference": {
+      "passed": 54,
+      "total": 54
+    },
+    "mounted": {
+      "passed": 54,
+      "total": 54
+    },
+    "case_corpus_sha256": "380c580f846ed2ecc2a70495be18ac3657053aafb89cb7bc85d231796a9ecbfb",
+    "coverage_sha256": "53967a2f01e2eb62fb4fbd801dc04dd425e66540c2e3a9991ad4570ca3311308",
+    "report_sha256": "e8d0e1baa95bfa1b15ae2bf77c9ffd733d87f6cf9d1ed236634938656cc5e8d0"
+  }
+}
