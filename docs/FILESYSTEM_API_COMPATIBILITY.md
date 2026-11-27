@@ -102,6 +102,18 @@ keychain interaction is unavailable. Therefore kernel-managed FIFO IPC on a
 ForkFS mount remains unverified and is not claimed here. See the [FIFO metadata
 pin evidence record](evidence/2026-11-16-fifo-metadata-pins.json).
 
+The table above describes historical core/RPC/callback evidence and the earlier
+candidate status. Subsequent qualification of signed main `02e1a12` on macOS 27.2.1 arm64
+passed the full APFS FIFO reference and found `mkfifo` returns `ENOTSUP` (45)
+on a private ForkFS mount. A separately instrumented build of the same source
+showed no create callback during that call; a regular-file control reached the
+callback and succeeded. The failed FIFO path remained absent and the sequence
+unchanged, and the loaded instrumented executable inode was verified. The local
+public FSKit SDK documents file and directory as valid create-item types. This
+observation does not establish routing on other OS versions or platforms, and
+the strict FIFO qualifier could not proceed to mounted stream checks. See the
+[native creation boundary evidence](evidence/2026-11-27-native-fifo-creation.json).
+
 ### Unix-domain socket pathname metadata
 
 The daemon stores socket pathnames as inode type tag 6 in the `FFINOD05`

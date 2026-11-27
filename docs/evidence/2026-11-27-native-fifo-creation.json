@@ -1,0 +1,27 @@
+{
+  "scope": "macOS 27.2.1 arm64, private disposable ForkFS mount and APFS reference; no general platform or FIFO IPC compatibility claim",
+  "source_revision": "02e1a123f5d1e1e2fef05a16ae61986c70c9cc59",
+  "signed_main": {
+    "extension_sha256": "4b6712ee97660dd1b37739cd37224c0ab221fa5b2b08f360f5dda6fdcd1adc09",
+    "daemon_sha256": "874ca31d23ce7deb0a76f4262529747228eb5171de5d0087992971ba0ac17e68",
+    "apfs_fifo_qualifier": "passed",
+    "forkfs_mkfifo_errno": 45,
+    "forkfs_mkfifo_error": "ENOTSUP"
+  },
+  "instrumented_same_source": {
+    "extension_sha256": "255a7da124531a80de99347364d68a82e1a42322e8c2df6a013480e78cf44c27",
+    "daemon_sha256": "874ca31d23ce7deb0a76f4262529747228eb5171de5d0087992971ba0ac17e68",
+    "loaded_executable_inode_verified": true,
+    "mkfifo_errno": 45,
+    "fifo_path_absent": true,
+    "sequence_unchanged": true,
+    "create_callback_observed_during_mkfifo": false,
+    "regular_file_control_create_callback_and_success": true,
+    "original_installation_restored": true
+  },
+  "sdk_context": "The locally installed public FSVolume.h documents file and directory as valid create-item types. This contextualizes the observation but does not establish routing on other OS versions or platforms.",
+  "limitation": "The strict mounted FIFO qualifier stops at mkfifo; subsequent FIFO stream operations on ForkFS were not tested. Instrumentation is diagnostic and is not the signed-main binary.",
+  "sdk_version": "27.2",
+  "sdk_build": "26B118",
+  "macos_build": "26B131"
+}
