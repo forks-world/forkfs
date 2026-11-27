@@ -284,13 +284,14 @@ BOOL emitsDotEntriesWithoutAttributes(void) {
     __block FSDirectoryVerifier out=verifier;NSError* e=[self perform:^{auto dir=[self item:directory];NSMutableDictionary* stream;
         BOOL withDots=attributes==nil && emitsDotEntriesWithoutAttributes();
         if(cookie==FSDirectoryCookieInitial){
-            // Retain at most 64 immutable daemon cursors, one page per stream.
+            // Retain at most 64 streams, one page per daemon cursor.
             // Evicted verifiers fail explicitly; they never restart on live data.
             if(_streams.count>=64){NSNumber* oldest=[[_streams.allKeys sortedArrayUsingSelector:@selector(compare:)] firstObject];
-                [self json:@[@"fs-dir-close",_streams[oldest][@"cursor"]]];[_streams removeObjectForKey:oldest];}
-            NSString* cursor=[self json:@[@"inode-dir-open",dir.inode]][@"cursor"];
-            stream=[@{@"directory":dir.inode,@"cursor":cursor,@"dots":@(withDots),@"dotID":@(dir.number),@"parentDotID":@(dir.parent),@"attributes":@(attributes!=nil),@"start":@0,@"entries":@[]} mutableCopy];
-            try{[self loadDirectoryPage:stream];}catch(...){try{[self json:@[@"fs-dir-close",cursor]];}catch(...){}throw;}
+                NSString* oldCursor=_streams[oldest][@"cursor"];if(oldCursor)[self json:@[@"fs-dir-close",oldCursor]];[_streams removeObjectForKey:oldest];}
+            stream=[@{@"directory":dir.inode,@"dots":@(withDots),@"dotID":@(dir.number),@"parentDotID":@(dir.parent),@"attributes":@(attributes!=nil),@"start":@0,@"entries":@[]} mutableCopy];
+            if(dir.detached)stream[@"eof"]=@(YES);
+            else {NSString* cursor=[self json:@[@"inode-dir-open",dir.inode]][@"cursor"];stream[@"cursor"]=cursor;
+                try{[self loadDirectoryPage:stream];}catch(...){try{[self json:@[@"fs-dir-close",cursor]];}catch(...){}throw;}}
             out=_nextStream++;_streams[@(out)]=stream;
         } else {stream=_streams[@(verifier)];require([stream[@"directory"] isEqual:dir.inode],ESTALE,"directory cookie belongs to another inode");
             require([stream[@"dots"] boolValue]==withDots && [stream[@"attributes"] boolValue]==(attributes!=nil),ESTALE,"directory cookie mode changed");
