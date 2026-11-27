@@ -1,0 +1,25 @@
+{
+  "scope": "macOS 27.2.1 build 26B131 arm64, private disposable ForkFS mount and APFS reference; no claim for other OS versions or platforms",
+  "source_revision": "02e1a123f5d1e1e2fef05a16ae61986c70c9cc59",
+  "signed_main": {
+    "extension_sha256": "4b6712ee97660dd1b37739cd37224c0ab221fa5b2b08f360f5dda6fdcd1adc09",
+    "daemon_sha256": "874ca31d23ce7deb0a76f4262529747228eb5171de5d0087992971ba0ac17e68",
+    "loaded_executable_inode_verified": true,
+    "apfs_socket_qualifier": "passed",
+    "forkfs_first_bind_errno": 45,
+    "forkfs_first_bind_error": "ENOTSUP",
+    "original_installation_restored": true
+  },
+  "instrumented_same_source": {
+    "extension_sha256": "255a7da124531a80de99347364d68a82e1a42322e8c2df6a013480e78cf44c27",
+    "daemon_sha256": "874ca31d23ce7deb0a76f4262529747228eb5171de5d0087992971ba0ac17e68",
+    "loaded_executable_inode_verified": true,
+    "bind_errno": 45,
+    "socket_path_absent": true,
+    "create_callback_observed_during_bind": false,
+    "regular_file_control_create_callback_and_success": true,
+    "global_daemon_sequence_advanced": true,
+    "original_installation_restored": true
+  },
+  "limitation": "The strict ForkFS qualifier stopped at its first bind; subsequent socket operations were not qualified. The sequence change does not establish a cause or failure atomicity. Instrumentation is diagnostic and is not the signed-main binary."
+}

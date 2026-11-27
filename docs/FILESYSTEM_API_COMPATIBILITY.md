@@ -146,6 +146,17 @@ establish that kernel `bind` routes through this callback. Native mounted
 socket pathname behavior remains unverified; no such claim is made. See the
 [socket evidence record](evidence/2026-11-16-unix-socket.json).
 
+The table and preceding account describe the earlier candidate status. Later
+qualification of signed main `02e1a12` on macOS 27.2.1 arm64 passed the APFS
+reference, while the first `bind` on a private ForkFS mount returned `ENOTSUP`
+(45); the strict mounted test stopped there. A separately instrumented build
+of the same source showed no create callback during the bind window and no
+socket pathname afterward; a regular-file control reached the create callback
+and succeeded. The global daemon sequence advanced during the diagnostic.
+Its cause and failure atomicity remain unresolved. The loaded executable
+inode was verified for this macOS build. See the
+[native bind boundary evidence](evidence/2026-11-27-native-unix-socket-bind.json).
+
 Namespace object resolution accepts a trailing slash for existing-object queries
 and metadata/content operations. The slash requires the resolved object to be a
 directory, including when the final component is a symlink to a directory;
