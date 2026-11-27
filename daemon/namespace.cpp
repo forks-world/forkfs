@@ -1263,7 +1263,7 @@ void Namespace::set_link_attributes(const std::string& path,const Attributes& a)
 void Namespace::set_path_attributes(const std::string& path,const Attributes& a,bool follow_final) {
     valid_attributes(a);
     update([&](const NamespaceView& view,Changes& changes) {
-        auto id=resolve(view,path,follow_final);auto n=inode(view,id);if(n.fifo && a.size)throw std::system_error(EINVAL,std::generic_category(),"FIFO size is fixed at zero");mutable_attributes(n,a);if(n.socket && a.size)throw std::system_error(EINVAL,std::generic_category(),"socket size is fixed at zero");
+        auto id=resolve(view,path,follow_final,nullptr,nullptr,true);auto n=inode(view,id);if(n.fifo && a.size)throw std::system_error(EINVAL,std::generic_category(),"FIFO size is fixed at zero");mutable_attributes(n,a);if(n.socket && a.size)throw std::system_error(EINVAL,std::generic_category(),"socket size is fixed at zero");
         need(!n.symlink || !a.size,"invalid symbolic link size change");
         if(n.directory && a.size)throw std::system_error(EISDIR,std::generic_category(),"directory size change");
         if(!a.mode && !a.modified_ns && !a.size && !a.accessed_ns && !a.birth_ns && !a.flags)return;

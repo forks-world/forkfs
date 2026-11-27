@@ -83,6 +83,12 @@ for binary in [BIN,LEGACY]:
                 assert json.loads(rpc('inode-stat',link,*sel))==changed
                 changed=json.loads(rpc('inode-setattr',link,0o700,'-',123,'-',*sel));assert changed['accessed_ns']==888 and changed['birth_ns']==999 and changed['modified_ns']==123
                 rpc('fs-lsettimes','/dangling',1,2,3,code=errno.EBUSY+1)
+                before_errors=json.loads(rpc('status'))['last_committed_seq']
+                for path,expected in [('/missing',errno.ENOENT),('/file/child',errno.ENOTDIR)]:
+                    rpc('fs-lchmod',path,'700',*sel,code=expected+1)
+                    rpc('fs-lsettimes',path,1,2,3,*sel,code=expected+1)
+                assert json.loads(rpc('status'))['last_committed_seq']==before_errors
+                assert json.loads(rpc('fs-lstat','/file'))==target
                 rpc('fs-lchmod','/dangling','755',*sel)
                 rpc('fs-lsettimes','/dangling',4,5,6,*sel);assert json.loads(rpc('fs-lstat','/dangling'))['birth_ns']==6
                 rpc('session-close',session)
