@@ -1398,6 +1398,15 @@
       ],
       "existing_external": [
         {
+          "id": "daemon_bsd_flags_errno",
+          "layer": "rpc",
+          "script": "daemon/tests/inode_rpc.py",
+          "status": "not_run",
+          "scenarios": [
+            "typed unsupported BSD flag masks and atomic rejection on paths, symlinks, and handles"
+          ]
+        },
+        {
           "id": "daemon_append_flags",
           "layer": "daemon_core",
           "script": "daemon/tests/append_flags.cpp",
