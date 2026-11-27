@@ -112,6 +112,16 @@ def main():
     report['namespace'] = '/' + root.name
     try:
         baseline = query(root, kind); report['queries']['directory'] = baseline
+        selected = query(target, kind)
+        same_volume(baseline, selected)
+        report['queries']['qualification_root'] = selected
+        descriptor = os.open(target, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            selected_fd = query(descriptor, kind)
+            same_volume(baseline, selected_fd)
+            report['queries']['qualification_root_fd'] = selected_fd
+        finally:
+            os.close(descriptor)
         path = root/'file'; path.write_bytes(b'volume-capacity\x00\xff')
         with path.open('rb') as stream:
             for phase in ['open', 'renamed', 'unlinked', 'reused']:

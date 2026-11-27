@@ -1204,7 +1204,7 @@
           "script": "scripts/tests/volume_capacity_mount.py",
           "status": "not_run",
           "scenarios": [
-            "fd/path statfs64, statvfs and pathconf volume geometry agreement"
+            "selected qualification root path and directory fd plus scratch fd/path statfs64, statvfs and pathconf volume geometry agreement"
           ]
         }
       ],
@@ -1631,7 +1631,7 @@
           "script": "scripts/tests/volume_capacity_mount.py",
           "status": "not_run",
           "scenarios": [
-            "PC_NAME_MAX and path/fd volume geometry; PC_PATH_MAX behavior for directory and file descriptors"
+            "PC_NAME_MAX and path/fd volume geometry; PC_PATH_MAX behavior for selected qualification root path and fd, scratch directory and file descriptors"
           ]
         }
       ],

@@ -547,6 +547,9 @@ revision 隔离及 GC 后只读重挂载；macOS 26 构建不宣称支持该新�
 增加一字节的 truncate 返回 EFBIG 且保留内容。`PC_PATH_MAX` 在本次子目录及
 文件 fd 上返回 EINVAL；公开 PathConfOperations 没有路径总长属性，daemon 的
 4096 字节限制不能当作该 syscall 的成功结果。
+macOS 27.2.1 的历史 ForkFS 私有挂载根目录路径及 fd 同样返回 EINVAL；该挂载
+使用 2026-11-13 注册的签名扩展和 daemon `282abf9`，并非当前候选。APFS 参考
+选定目录路径及 fd 返回 1024；该目录不一定是整个卷的根目录。
 
 本轮同时修复超长路径/组件及符号链接目标返回 EINVAL 的问题，现返回
 ENAMETOOLONG，其他非法名称仍为 EINVAL，拒绝操作不产生提交。组件上限按
