@@ -576,6 +576,15 @@
       ],
       "existing_external": [
         {
+          "id": "daemon_truncate_size_limit",
+          "layer": "rpc",
+          "script": "daemon/tests/rpc.py",
+          "status": "not_run",
+          "scenarios": [
+            "path and handle truncate above 1 TiB return EFBIG without mutation or cursor movement"
+          ]
+        },
+        {
           "id": "daemon_file_io",
           "layer": "daemon_core",
           "script": "daemon/tests/file_io.cpp",
