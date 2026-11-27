@@ -65,6 +65,18 @@ macOS 27.2.1 上，用 main `3e7ea34` 构建 daemon，并使用本机已注册�
 - `directory_handle_relative_create_survives_rename_and_path_reuse`
 - `rename_cross_parent_replaces_empty_directory`
 
-独立探针在旧扩展上确认，`rmdir` 后原目录 fd 的 `fstat` 仍保留 inode，原路径查询返回 `ENOENT`，`flistxattr` 和 `mkdirat` 返回 `ESTALE`。新版扩展在 `codesign` 阶段返回 `errSecInternalComponent`，第 2 项仍待用同一提交的签名扩展和 daemon 验收。
+独立探针在旧扩展上确认，`rmdir` 后原目录 fd 的 `fstat` 仍保留 inode，原路径查询返回 `ENOENT`，`flistxattr` 和 `mkdirat` 返回 `ESTALE`。新版扩展在 `codesign` 阶段返回 `errSecInternalComponent`，当时第 2 项仍待用同一提交的签名扩展和 daemon 验收。
 
 本次配对报告的案例哈希为 `7cc8f670eb7fe89d7362eee0e6091a408756e4683db71a04363cbb7d6f93c370`，清单哈希为 `ab8d81682d8824f1aef2f214fcaf103740965bf99c290ce05d391b7f700ba7ba`。
+
+## 同提交签名挂载验收
+
+2026-11-26 在 macOS 27.2.1 上完成第 2 项。FSKit 扩展和 daemon 均从 main
+`02e1a12` 构建。Apple Development 签名在本机图形登录会话中通过，实挂载时
+核对了运行中扩展的可执行文件 inode。可写挂载和只读 revision 重挂载通过，
+冒烟测试通过 13/13，CTest 通过 87/87。
+
+两次契约对照均为 APFS 54/54、ForkFS 53/54。剩余差异属于第 4 项。
+通过已删除的目录 fd 调用 `mkdirat` 时，APFS 返回 `ENOENT`，ForkFS 返回
+`ESTALE`，失败前后的状态指纹一致。构建、报告哈希和失败步骤见
+[签名部署记录](evidence/2026-11-26-signed-fskit-deployment.json)。
