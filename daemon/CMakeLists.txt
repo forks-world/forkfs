@@ -472,4 +472,7 @@ if(APPLE)
     add_test(NAME forkfs_sync_reference COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_SOURCE_DIR}/scripts/tests/sync_mount.py /private/tmp --reference-apfs)
     set_tests_properties(forkfs_sync_reference PROPERTIES TIMEOUT 90)
+    add_test(NAME forkfs_git_linked_worktree_reference COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_SOURCE_DIR}/scripts/tests/filesystem_compat.py /private/tmp --reference-apfs --case git-linked-worktree)
+    set_tests_properties(forkfs_git_linked_worktree_reference PROPERTIES TIMEOUT 150)
 endif()
