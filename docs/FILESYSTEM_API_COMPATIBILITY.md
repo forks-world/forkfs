@@ -437,6 +437,7 @@ python3 scripts/tests/filesystem_compat.py /private/tmp --reference-apfs
 | lockf / flock | 另一进程争锁必须失败、关闭及进程退出释放；lockf 另测互不相交范围 |
 | SQLite DELETE / WAL | 显式模式确认、二进制数据、并发读与写锁冲突、rollback、进程未 close 即退出后的事务恢复、integrity_check、WAL checkpoint |
 | Git | init/add/commit、分支 checkout、可执行位/符号链接、fast-forward merge、repack、strict fsck、历史二进制内容 |
+| Git linked worktree | 独立索引与共享管理目录、linked 分支提交与原 worktree 隔离、remove/prune 后保留提交；APFS 参考及临时签名 ForkFS 挂载通过（共享 Git helper 重构前），见 [证据](evidence/2026-11-28-git-linked-worktree.json)；未验收 linked worktree 的 revision readback |
 
 这证明普通 Git 程序可使用被测挂载，不表示已恢复废弃的 `world` Git 集成。
 SQLite 的 [锁和同步要求](https://www.sqlite.org/lockingv3.html) 说明为什么不能

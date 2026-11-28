@@ -1,0 +1,23 @@
+{
+  "date": "2026-11-28",
+  "scope": "Git linked worktree and filesystem compatibility workloads on APFS and a temporary signed ForkFS mount",
+  "source_commit": "eabb00d7e9b00b6e4bd1dcd5aa05f7a434fe8268",
+  "platform": "macOS 27.2.1 arm64",
+  "git": "git version 2.54.0 (Apple Git-157)",
+  "filesystem": "forkfs",
+  "extension_sha256": "4497094e9d8e1b3c1c457b427aeb94abd939f16194bee9a89e28c743a9418d13",
+  "daemon_sha256": "a1acc35d879e64541ccb9901007ee609b706cc8053897bf94929c0b77b17d456",
+  "loaded_extension_inode_verified": true,
+  "original_installation_restored": true,
+  "deployment_report_sha256": "8f9907d5124ac5ef2b40a13ce19bc3ab201fa9d8b5e9e1f21371df7a56f69ca7",
+  "workflow_cases_passed": 12,
+  "workflow_cases_total": 12,
+  "linked_worktree": "passed",
+  "limitations": [
+    "One temporary mount and small local repository",
+    "No linked worktree revision readback qualification",
+    "No crash or power-loss guarantee"
+  ],
+  "apfs_workflow_report_sha256": "f0669cd1f788fd017da825dfbb167160aa06ec8df984259a25db7dcde79fe06c",
+  "forkfs_workflow_report_sha256": "7d9e129194211fdb35318348d0024fbd05ec57ec021f02dd5ddfa7aed425187c"
+}
