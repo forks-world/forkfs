@@ -436,10 +436,8 @@ os._exit(0)
             'concurrent_reader_writer': True, 'abrupt_process_exit_recovery': True}
 
 
-def git_workflow(root):
-    directory = root / 'git'
-    directory.mkdir()
-    # No user/system config, signing, hooks, credentials, templates or network.
+# No user/system config, signing, hooks, credentials, templates or network.
+def git_command(cwd, *arguments):
     environment = {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'LC_ALL': 'C',
                    'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null',
                    'GIT_TERMINAL_PROMPT': '0', 'GIT_AUTHOR_NAME': 'ForkFS acceptance',
@@ -447,10 +445,16 @@ def git_workflow(root):
                    'GIT_COMMITTER_NAME': 'ForkFS acceptance',
                    'GIT_COMMITTER_EMAIL': 'acceptance@example.invalid'}
 
+    return subprocess.run(['/usr/bin/git', '-c', 'core.hooksPath=/dev/null',
+                           '-c', 'commit.gpgSign=false', *arguments], cwd=cwd,
+                          env=environment, check=True, capture_output=True, timeout=30).stdout
+
+
+def git_workflow(root):
+    directory = root / 'git'
+    directory.mkdir()
     def git(*arguments):
-        return subprocess.run(['/usr/bin/git', '-c', 'core.hooksPath=/dev/null',
-                               '-c', 'commit.gpgSign=false', *arguments], cwd=directory,
-                              env=environment, check=True, capture_output=True, timeout=30).stdout
+        return git_command(directory, *arguments)
 
     git('init', '--template=', '-b', 'main')
     (directory / 'binary').write_bytes(b'first\x00\xff')
@@ -478,11 +482,65 @@ def git_workflow(root):
     return {'version': git('--version').decode().strip(), 'checkout_merge_repack_fsck': True}
 
 
+def git_linked_worktree(root):
+    directory = root / 'repository'
+    linked = root / 'linked'
+    directory.mkdir(mode=0o700)
+    def git(cwd, *arguments):
+        return git_command(cwd, *arguments)
+
+    git(directory, 'init', '--template=', '-b', 'main')
+    (directory / 'binary').write_bytes(b'first\x00\xff')
+    executable = directory / 'executable'
+    executable.write_text('#!/bin/sh\nexit 0\n')
+    executable.chmod(0o755)
+    os.symlink('binary', directory / 'link')
+    git(directory, 'add', '.')
+    git(directory, 'commit', '-m', 'first')
+    original_head = git(directory, 'rev-parse', 'HEAD').strip()
+    original_index = (directory / '.git/index').read_bytes()
+    git(directory, 'worktree', 'add', '-b', 'linked-branch', str(linked))
+    common = (directory / '.git').resolve(strict=True)
+    pointer = (linked / '.git').read_text().strip()
+    check(pointer.startswith('gitdir: '), 'linked worktree has no gitdir pointer')
+    pointer_path = Path(pointer[len('gitdir: '):])
+    admin = (linked / pointer_path).resolve(strict=True)
+    reported_admin = Path(os.fsdecode(git(linked, 'rev-parse', '--absolute-git-dir').strip())).resolve(strict=True)
+    check(admin == reported_admin and admin.parent == common / 'worktrees', 'linked gitdir pointer escaped expected admin directory')
+    reported_common = Path(os.fsdecode(git(linked, 'rev-parse', '--git-common-dir').strip()))
+    check((linked / reported_common).resolve(strict=True) == common, 'linked common directory mismatch')
+    linked_index = Path(os.fsdecode(git(linked, 'rev-parse', '--git-path', 'index').strip()))
+    linked_index = (linked / linked_index).resolve(strict=True)
+    check(linked_index == admin / 'index' and linked_index != (common / 'index').resolve(strict=True), 'linked index is not distinct')
+    check((linked / 'binary').read_bytes() == b'first\x00\xff' and os.readlink(linked / 'link') == 'binary' and (linked / 'executable').stat().st_mode & 0o111, 'linked checkout changed fixture')
+    (linked / 'binary').write_bytes(b'linked\x00\xfe')
+    git(linked, 'add', 'binary')
+    git(linked, 'commit', '-m', 'linked commit')
+    linked_head = git(linked, 'rev-parse', 'HEAD').strip()
+    check(linked_head != original_head and git(directory, 'rev-parse', 'HEAD').strip() == original_head, 'linked commit changed original HEAD')
+    check((directory / 'binary').read_bytes() == b'first\x00\xff' and (common / 'index').read_bytes() == original_index, 'linked commit changed original bytes or index')
+    check(git(directory, 'status', '--porcelain') == b'' and git(linked, 'status', '--porcelain') == b'', 'worktree is dirty after commit')
+    check(git(directory, 'show', 'linked-branch:binary') == b'linked\x00\xfe', 'linked branch content is not readable')
+    listing = git(directory, 'worktree', 'list', '--porcelain').decode().splitlines()
+    check('worktree ' + str(directory.resolve()) in listing and 'worktree ' + str(linked.resolve()) in listing, 'worktree registration missing')
+    git(directory, 'worktree', 'remove', str(linked))
+    git(directory, 'worktree', 'prune')
+    listing = git(directory, 'worktree', 'list', '--porcelain').decode().splitlines()
+    check(listing.count('worktree ' + str(directory.resolve())) == 1 and sum(line.startswith('worktree ') for line in listing) == 1, 'worktree registration not pruned')
+    check(not linked.exists() and not admin.exists(), 'linked worktree or admin directory survived removal')
+    check(git(directory, 'rev-parse', 'HEAD').strip() == original_head and git(directory, 'rev-parse', 'linked-branch').strip() == linked_head, 'worktree removal changed refs')
+    check(git(directory, 'show', 'linked-branch:binary') == b'linked\x00\xfe' and git(directory, 'status', '--porcelain') == b'', 'linked commit lost after worktree removal')
+    return {'version': git(directory, '--version').decode().strip(),
+            'linked_admin_common_and_distinct_index': True,
+            'independent_commit_and_removal': True}
+
+
 CASES = {'mmap': mapped_io, 'mmap-truncate': truncate_regrow,
          'lockf': lambda root: locks(root, 'lockf'),
          'flock': lambda root: locks(root, 'flock'),
          'sqlite-delete': lambda root: database(root, 'DELETE'),
          'sqlite-wal': lambda root: database(root, 'WAL'), 'git': git_workflow,
+         'git-linked-worktree': git_linked_worktree,
          'open-flags': open_flags, 'append': append_io, 'permissions': permissions,
          'relative-paths': relative_paths}
 PROBES = {'rename-extensions': rename_extensions}
