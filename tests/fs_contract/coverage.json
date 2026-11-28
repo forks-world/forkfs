@@ -1819,7 +1819,17 @@
     },
     "fsevents": {
       "case_ids": [],
-      "existing_external": [],
+      "existing_external": [
+        {
+          "id": "native_fsevents_live_subtree",
+          "layer": "posix",
+          "script": "scripts/tests/fsevents_mount.py",
+          "status": "not_run",
+          "scenarios": [
+            "live recursive file-event stream for descendant create, write, rename and delete; no ordering or event count assumption"
+          ]
+        }
+      ],
       "missing_contracts": [
         {
           "id": "fsevents_contract",
@@ -1829,7 +1839,7 @@
             "mounted"
           ],
           "mandatory": false,
-          "reason": "FSEvents is explicitly outside the current native event suite; recursive monitoring and revoke behavior are not qualified."
+          "reason": "The DSL has no FSEvents subscription; the native probe covers only a live subtree, not replay, overflow recovery or revoke."
         }
       ]
     },
