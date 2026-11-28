@@ -422,10 +422,12 @@ python3 scripts/tests/filesystem_compat.py /path/to/mount \
   --daemon build/Release/daemon/forkfsd --socket /path/to/runtime/control.sock
 # 相同用例在 APFS 上运行，作为宿主环境对照：
 python3 scripts/tests/filesystem_compat.py /private/tmp --reference-apfs
+# 单独运行 CI 中的 Git linked worktree APFS 对照：
+ctest --test-dir build/Release -R '^forkfs_git_linked_worktree_reference$' --output-on-failure
 ```
 
 必须使用可丢弃的 repository。脚本验证实际文件系统类型，只在唯一临时目录内
-写入并清理。forkfs 模式还保留一个命名 revision，验证 mmap 数据已进入 daemon，
+写入并清理。forkfs 模式执行 mmap 用例时还保留一个命名 revision，验证 mmap 数据已进入 daemon，
 以及后续写入不能修改历史；不自动删除该 revision。各组用例有子进程超时，
 输出 JSON，任一失败返回非零。Git 用例禁用用户/系统配置、签名、hooks、模板，
 不连接远端。
@@ -437,7 +439,7 @@ python3 scripts/tests/filesystem_compat.py /private/tmp --reference-apfs
 | lockf / flock | 另一进程争锁必须失败、关闭及进程退出释放；lockf 另测互不相交范围 |
 | SQLite DELETE / WAL | 显式模式确认、二进制数据、并发读与写锁冲突、rollback、进程未 close 即退出后的事务恢复、integrity_check、WAL checkpoint |
 | Git | init/add/commit、分支 checkout、可执行位/符号链接、fast-forward merge、repack、strict fsck、历史二进制内容 |
-| Git linked worktree | 独立索引与共享管理目录、linked 分支提交与原 worktree 隔离、remove/prune 后保留提交；APFS 参考及临时签名 ForkFS 挂载通过（共享 Git helper 重构前），见 [证据](evidence/2026-11-28-git-linked-worktree.json)；未验收 linked worktree 的 revision readback |
+| Git linked worktree | 独立索引与共享管理目录、linked 分支提交与原 worktree 隔离、remove/prune 后保留提交；APFS 参考及临时签名 ForkFS 挂载通过；macOS CI 执行 APFS 参考，见 [证据](evidence/2026-11-28-git-linked-worktree.json)；未验收 linked worktree 的 revision readback |
 
 这证明普通 Git 程序可使用被测挂载，不表示已恢复废弃的 `world` Git 集成。
 SQLite 的 [锁和同步要求](https://www.sqlite.org/lockingv3.html) 说明为什么不能

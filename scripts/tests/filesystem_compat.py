@@ -568,7 +568,9 @@ def main():
     parser.add_argument('--socket', type=Path)
     parser.add_argument('--world', default='main')
     operations = dict(CASES, **PROBES)
-    parser.add_argument('--worker-case', choices=operations, help=argparse.SUPPRESS)
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument('--case', choices=CASES, help='run one application workflow')
+    selection.add_argument('--worker-case', choices=operations, help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.worker_case:
         print(json.dumps(operations[args.worker_case](args.mountpoint)))
@@ -588,8 +590,9 @@ def main():
     if not args.reference_apfs:
         report['forkfs_maximum_file_bytes'] = 1 << 40
     root = Path(tempfile.mkdtemp(prefix='forkfs-api-', dir=target))
+    selected_operations = [args.case] if args.case else operations
     try:
-        for name in operations:
+        for name in selected_operations:
             group = report['cases'] if name in CASES else report['capability_probes']
             case_root = root / name
             case_root.mkdir(mode=0o700)
@@ -602,7 +605,7 @@ def main():
                                'details': json.loads(result.stdout)}
             except (RuntimeError, subprocess.TimeoutExpired) as error:
                 group[name] = {'status': 'failed', 'error': str(error)}
-        if not args.reference_apfs and report['cases']['mmap']['status'] == 'passed':
+        if not args.reference_apfs and report['cases'].get('mmap', {}).get('status') == 'passed':
             def rpc(*fields, revision=None):
                 view = ['--revision', revision] if revision else ['--world', args.world]
                 return subprocess.run([str(args.daemon.resolve(strict=True)), 'request',
