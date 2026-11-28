@@ -1153,7 +1153,14 @@ void Namespace::replace_file(const std::string& path,const Bytes& value) {
 Bytes Namespace::read(const std::string& path) const {return read_at(path,0,UINT64_MAX);}
 void Namespace::edit_content(const std::string& path,const std::function<bool(FileContent&)>& edit) {
     update([&](const NamespaceView& view,Changes& changes) {
-        auto id=resolve(view,path);auto n=inode(view,id);if(n.fifo||n.socket)throw std::system_error(ENOTSUP,std::generic_category(),"special inode has no byte stream");need(!n.directory && !n.symlink,"cannot modify directory content");mutable_inode(n);
+        auto id=resolve(view,path,true,nullptr,nullptr,true);
+        auto n=inode(view,id);
+        if(n.fifo || n.socket)
+            throw std::system_error(ENOTSUP,std::generic_category(),"special inode has no byte stream");
+        if(n.directory)
+            throw std::system_error(EISDIR,std::generic_category(),"cannot modify directory content");
+        need(!n.symlink,"cannot modify directory content");
+        mutable_inode(n);
         FileContent data(n,view,&changes);if(!edit(data))return;
         touch(n);changes[inode_key(id)]=encode(n);
     });
