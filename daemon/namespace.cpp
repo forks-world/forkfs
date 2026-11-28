@@ -1183,7 +1183,9 @@ void Namespace::punch_hole(const std::string& path,uint64_t offset,uint64_t leng
 Bytes Namespace::read_at(const std::string& path,uint64_t offset,uint64_t count) const {
     need(offset<=INT64_MAX,"file offset exceeds signed 64-bit range");
     std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);auto n=inode(view,resolve(view,path,true,nullptr,nullptr,true));
-    if(n.fifo||n.socket)throw std::system_error(ENOTSUP,std::generic_category(),"special inode has no byte stream");need(!n.directory,"cannot read a directory");return FileContent(n,view).read(offset,count);
+    if(n.fifo||n.socket)throw std::system_error(ENOTSUP,std::generic_category(),"special inode has no byte stream");
+    if(n.directory)throw std::system_error(EISDIR,std::generic_category(),"cannot read a directory");
+    return FileContent(n,view).read(offset,count);
 }
 uint64_t Namespace::seek_region(const std::string& path,uint64_t offset,bool data) const {
     std::lock_guard lock(container_.mutex_);NamespaceView view(*container_.journal_,view_,revision_);

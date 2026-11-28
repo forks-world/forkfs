@@ -87,6 +87,17 @@ with tempfile.TemporaryDirectory(prefix='ffrpc-',dir='/tmp') as tmp:
         assert json.loads(raw(['fs-stat','/trail-alias/']))['inode_id']==src_id
         assert json.loads(raw(['fs-lstat','/trail-alias/']))['inode_id']==src_id
         assert raw(['fs-cat','/rpc-file'])==b'R'
+        read_seq=json.loads(raw(['status']))['last_committed_seq']
+        read_dir_before=json.loads(raw(['fs-stat','/src']))
+        read_listing_before=raw(['fs-ls','/src'])
+        for directory in ['/src','/trail-alias']:
+            raw(['fs-cat',directory],ok=False,expected_code=errno.EISDIR+1)
+            raw(['fs-read-at',directory,'0','8'],ok=False,expected_code=errno.EISDIR+1)
+            raw(['fs-read-at',directory,'0','0'],ok=False,expected_code=errno.EISDIR+1)
+        assert json.loads(raw(['fs-stat','/src']))==read_dir_before
+        assert raw(['fs-ls','/src'])==read_listing_before
+        assert json.loads(raw(['status']))['last_committed_seq']==read_seq
+        assert raw(['fs-read-at','/rpc-file','0','1'])==b'R'
         trailing_seq=json.loads(raw(['status']))['last_committed_seq']
         for query, expected_error in [('/rpc-file/', errno.ENOTDIR),
                                       ('/trail-dangling/', errno.ENOENT),
