@@ -104,6 +104,15 @@
       ],
       "existing_external": [
         {
+          "id": "daemon_content_mutation_path_errno",
+          "layer": "rpc",
+          "script": "daemon/tests/rpc.py",
+          "status": "not_run",
+          "scenarios": [
+            "write-at, append, truncate and punch-hole reject missing, non-directory prefix and directory paths atomically"
+          ]
+        },
+        {
           "id": "daemon_trailing_paths_cpp",
           "layer": "daemon_core",
           "script": "daemon/tests/trailing_paths.cpp",

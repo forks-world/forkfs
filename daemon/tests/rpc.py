@@ -197,6 +197,27 @@ with tempfile.TemporaryDirectory(prefix='ffrpc-',dir='/tmp') as tmp:
             assert json.loads(raw(['fs-hseek',truncate_dup,'0','cur']))['offset']==17
         cli('fs-close',truncate_dup);cli('fs-close',truncate_handle)
         cli('fs-unlink','/truncate-limit')
+        # Content mutations preserve state on path resolution and directory errors.
+        raw(['fs-write','/content-errors',b'original'])
+        raw(['fs-mkdir','/content-error-dir'])
+        raw(['fs-symlink','/content-errors','/content-error-alias'])
+        content_before=json.loads(raw(['fs-stat','/content-errors']))
+        directory_before=json.loads(raw(['fs-stat','/content-error-dir']))
+        content_seq=json.loads(raw(['status']))['last_committed_seq']
+        for path,code in [('/content-missing',errno.ENOENT),
+                          ('/content-errors/child',errno.ENOTDIR),
+                          ('/content-error-dir',errno.EISDIR)]:
+            for fields in [['fs-write-at',path,'0',b'X'], ['fs-append',path,b'X'],
+                           ['fs-truncate',path,'2'], ['fs-punch-hole',path,'0','1']]:
+                raw(fields,ok=False,expected_code=code+1)
+                assert json.loads(raw(['status']))['last_committed_seq']==content_seq
+                assert json.loads(raw(['fs-stat','/content-errors']))==content_before
+                assert json.loads(raw(['fs-stat','/content-error-dir']))==directory_before
+                assert raw(['fs-cat','/content-errors'])==b'original'
+        raw(['fs-write-at','/content-error-alias','0',b'O'])
+        assert raw(['fs-cat','/content-errors'])==b'Original'
+        assert json.loads(raw(['fs-lstat','/content-error-alias']))['symlink']
+        raw(['fs-unlink','/content-error-alias']);raw(['fs-unlink','/content-errors']);raw(['fs-rmdir','/content-error-dir'])
         # Offset operations use the same resident transaction and retain snapshots.
         data.write_bytes(b'abcdef');cli('fs-write','/offset',data)
         data.write_bytes(b'XY');cli('fs-write-at','/offset','2',data)
